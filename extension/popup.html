@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 420px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 16px;
+    }
+    h1 { font-size: 16px; font-weight: 600; margin-bottom: 4px; color: #38bdf8; }
+    .subtitle { font-size: 11px; color: #64748b; margin-bottom: 14px; }
+
+    .status-bar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 12px;
+    }
+    .status-bar.connected { background: #064e3b; color: #6ee7b7; }
+    .status-bar.disconnected { background: #450a0a; color: #fca5a5; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .connected .dot { background: #34d399; }
+    .disconnected .dot { background: #f87171; }
+
+    label {
+      display: block; font-size: 12px; font-weight: 500; color: #94a3b8; margin-bottom: 4px;
+    }
+    .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+    .field-group { margin-bottom: 14px; }
+
+    input[type="text"], input[type="date"] {
+      width: 100%; background: #1e293b; border: 1px solid #334155;
+      border-radius: 6px; color: #e2e8f0; padding: 6px 10px; font-size: 12px;
+    }
+    input[type="text"]:focus, input[type="date"]:focus { outline: none; border-color: #38bdf8; }
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(1); opacity: 0.4; }
+
+    textarea {
+      width: 100%; height: 120px; background: #1e293b; border: 1px solid #334155;
+      border-radius: 8px; color: #e2e8f0; padding: 10px;
+      font-family: 'SF Mono', 'Consolas', monospace; font-size: 11px;
+      resize: vertical; margin-bottom: 4px;
+    }
+    textarea:focus { outline: none; border-color: #38bdf8; }
+    .hint { font-size: 10px; color: #475569; margin-bottom: 14px; }
+
+    .filter-section { margin-bottom: 14px; }
+    .filter-row { display: flex; gap: 14px; margin-top: 6px; flex-wrap: wrap; align-items: center; }
+    .filter-divider { width: 1px; height: 14px; background: #334155; }
+    .checkbox-label {
+      display: flex; align-items: center; gap: 5px;
+      font-size: 12px; color: #94a3b8; cursor: pointer; font-weight: normal; margin-bottom: 0;
+    }
+    .checkbox-label input[type="checkbox"] { accent-color: #0ea5e9; }
+
+    .btn {
+      width: 100%; padding: 10px; border: none; border-radius: 8px;
+      font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s;
+    }
+    .btn-primary { background: #0ea5e9; color: white; }
+    .btn-primary:hover { background: #0284c7; }
+    .btn-primary:disabled { background: #1e3a5f; color: #475569; cursor: not-allowed; }
+    .btn-secondary { background: #1e293b; color: #94a3b8; border: 1px solid #334155; margin-top: 8px; }
+    .btn-secondary:hover { background: #334155; }
+    .btn-danger { background: #1e293b; color: #f87171; border: 1px solid #7f1d1d; margin-top: 8px; }
+    .btn-danger:hover { background: #450a0a; }
+
+    #progress { margin-top: 14px; display: none; }
+    .progress-header { display: flex; justify-content: space-between; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+    .progress-track { height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
+    .progress-fill { height: 100%; background: #38bdf8; border-radius: 3px; transition: width 0.3s; width: 0%; }
+
+    #log {
+      margin-top: 10px; max-height: 130px; overflow-y: auto;
+      font-size: 11px; font-family: 'SF Mono', 'Consolas', monospace;
+      background: #1e293b; border-radius: 6px; padding: 8px; display: none;
+    }
+    #log .error { color: #f87171; }
+    #log .success { color: #34d399; }
+    #log .info { color: #94a3b8; }
+
+    .ocr-section { border-top: 1px solid #1e293b; padding: 8px 10px 6px; margin-bottom: 14px; }
+    .ocr-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+    .ocr-hint { font-size: 10px; color: #475569; }
+    .ocr-drop {
+      border: 1px dashed #334155; border-radius: 6px; padding: 10px;
+      text-align: center; font-size: 11px; color: #475569; cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .ocr-drop:focus, .ocr-drop.active { border-color: #38bdf8; color: #94a3b8; outline: none; }
+    .ocr-preview { margin-top: 6px; display: flex; flex-direction: column; gap: 5px; }
+    #ocrImg { max-width: 100%; max-height: 100px; object-fit: contain; border-radius: 4px; border: 1px solid #1e293b; }
+    .ocr-status { font-size: 11px; color: #64748b; min-height: 14px; }
+    .ocr-result { width: 100%; height: 80px; resize: vertical; font-family: monospace; font-size: 11px;
+      background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 5px 7px; }
+    .ocr-btns { display: flex; gap: 6px; }
+    .ocr-btns button { flex: 1; padding: 5px; border-radius: 5px; font-size: 11px; cursor: pointer; border: none; }
+    #ocrApplyBtn { background: #0ea5e9; color: white; font-weight: 600; }
+    #ocrClearBtn { background: #1e293b; color: #64748b; }
+  </style>
+</head>
+<body>
+  <h1>PACS Clinic Preloader</h1>
+  <p class="subtitle">Preload patient images for fast iPad viewing</p>
+
+  <div id="pacsStatus" class="status-bar disconnected">
+    <div class="dot"></div>
+    <span id="pacsStatusText">Not on InteleBrowser page</span>
+  </div>
+
+  <div class="row-2">
+    <div>
+      <label>Local server</label>
+      <input type="text" id="serverUrl" value="http://localhost:8888" />
+    </div>
+    <div>
+      <label>Clinic date</label>
+      <input type="date" id="clinicDate" />
+    </div>
+  </div>
+
+  <label>Clinic Schedule (one patient per line)</label>
+  <textarea id="schedule" placeholder="Last, First  MM/DD/YYYY
+Smith, John  01/15/1965
+Doe, Jane  03/22/1980"></textarea>
+  <div class="hint">Format: "Last, First  MM/DD/YYYY" — one patient per line</div>
+
+  <!-- Schedule OCR -->
+  <div class="ocr-section" id="ocrSection">
+    <div class="ocr-header">
+      <span class="section-label">Schedule from Screenshot</span>
+      <span class="ocr-hint">Win+Shift+S → copy → paste below</span>
+    </div>
+    <div class="ocr-drop" id="ocrDrop" tabindex="0">
+      Click here, then Ctrl+V to paste screenshot
+    </div>
+    <div class="ocr-preview" id="ocrPreview" style="display:none">
+      <img id="ocrImg" alt="pasted screenshot">
+      <div class="ocr-status" id="ocrStatus"></div>
+      <textarea id="ocrResult" class="ocr-result" placeholder="Extracted patients (edit as needed)…" spellcheck="false"></textarea>
+      <details id="ocrRawDetails" style="margin-top:2px">
+        <summary style="font-size:10px;color:#475569;cursor:pointer">Raw OCR text</summary>
+        <textarea id="ocrRaw" class="ocr-result" style="height:60px;margin-top:3px;color:#64748b" readonly></textarea>
+      </details>
+      <div class="ocr-btns">
+        <button id="ocrApplyBtn">↑ Apply to Schedule</button>
+        <button id="ocrClearBtn">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="filter-section">
+    <label>Filters</label>
+    <div class="filter-row">
+      <label class="checkbox-label"><input type="checkbox" id="filterSpine" checked> Spine only</label>
+      <div class="filter-divider"></div>
+      <label class="checkbox-label"><input type="checkbox" id="filterXR" checked> XR</label>
+      <label class="checkbox-label"><input type="checkbox" id="filterCT" checked> CT</label>
+      <label class="checkbox-label"><input type="checkbox" id="filterMR"> MRI</label>
+    </div>
+  </div>
+
+  <button class="btn btn-primary" id="preloadBtn" disabled>Preload Images</button>
+  <button class="btn btn-secondary" id="viewerBtn">Open Viewer ↗</button>
+  <button class="btn btn-danger" id="clearBtn">Clear Cached Data</button>
+
+  <div id="progress">
+    <div class="progress-header">
+      <span id="progressLabel">Searching...</span>
+      <span id="progressCount">0 / 0</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+  </div>
+  <div id="log"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

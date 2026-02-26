@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "PACS Clinic Preloader (DOM)",
+  "version": "2.0.0",
+  "description": "Preload clinic X-rays — DOM-based UI automation (no GWT-RPC parsing)",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "cookies",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://pacs.renoortho.com/*",
+    "http://localhost:8888/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon48.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://pacs.renoortho.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://pacs.renoortho.com/*"],
+      "js": ["content-debug.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

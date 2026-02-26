@@ -1,0 +1,1469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>PACS Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%; overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', sans-serif;
+      background: #000; color: #e2e8f0;
+      touch-action: none; -webkit-user-select: none; user-select: none;
+    }
+
+    .app { display: flex; height: 100vh; }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      width: 260px; background: #0f172a; border-right: 1px solid #1e293b;
+      display: flex; flex-direction: column; flex-shrink: 0;
+      transition: transform 0.3s ease; z-index: 10;
+    }
+    .sidebar.collapsed { transform: translateX(-260px); margin-right: -260px; }
+    .sidebar-header {
+      padding: 14px 16px; border-bottom: 1px solid #1e293b;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .sidebar-header h1 { font-size: 17px; font-weight: 600; color: #38bdf8; }
+    .sidebar-header button { background: none; border: none; color: #64748b; cursor: pointer; padding: 4px 8px; line-height: 0; }
+    .sidebar-header button .icon { width: 20px; height: 20px; display: block; }
+    .toggle-sidebar .icon { width: 22px; height: 22px; }
+    .nav-arrow .icon { width: 32px; height: 32px; }
+    .fs-close .icon { width: 20px; height: 20px; }
+    .fs-nav .icon { width: 28px; height: 28px; }
+    .patient-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .patient-item { padding: 13px 16px; border-bottom: 1px solid #1e293b; cursor: pointer; transition: background 0.15s; }
+    .patient-item.active, .patient-item:active { background: #1e3a5f; }
+    .patient-name { font-size: 15px; font-weight: 500; color: #f1f5f9; }
+    .patient-meta { font-size: 11px; color: #64748b; margin-top: 2px; }
+    .patient-badge { display: inline-block; background: #1e293b; color: #94a3b8; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-top: 4px; }
+    .empty-state { padding: 40px 20px; text-align: center; color: #475569; }
+    .empty-state p { margin-top: 8px; font-size: 13px; }
+
+    /* ── Viewer shell ── */
+    .viewer { flex: 1; display: flex; flex-direction: column; position: relative; background: #000; overflow: hidden; }
+
+    /* ── Top header overlay: stacks toolbar / study chips / filter bar ── */
+    .viewer-header {
+      position: absolute; top: 0; left: 0; right: 0; z-index: 20;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.65) 80%, transparent 100%);
+      padding-bottom: 12px;
+      transition: opacity 0.3s;
+    }
+    .viewer-header.hidden { opacity: 0; pointer-events: none; }
+
+    .toolbar-row { padding: 12px 14px; display: flex; justify-content: space-between; align-items: center; }
+    .toggle-sidebar {
+      background: rgba(255,255,255,0.1); border: none; color: #e2e8f0;
+      font-size: 22px; width: 40px; height: 40px; border-radius: 10px;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+    }
+    .viewer-info { text-align: right; }
+    .viewer-patient-name { font-size: 14px; font-weight: 500; }
+    .viewer-study-info { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+
+    /* Study chip bar */
+    .study-bar {
+      display: flex; gap: 6px; padding: 0 12px 8px;
+      overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    .study-bar::-webkit-scrollbar { display: none; }
+    .study-btn {
+      padding: 5px 12px; border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 12px; background: rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.65); font-size: 11px; font-weight: 500;
+      cursor: pointer; white-space: nowrap; transition: all 0.15s;
+      -webkit-tap-highlight-color: transparent; flex-shrink: 0;
+      text-align: left; line-height: 1.3;
+    }
+    .study-btn.active { background: rgba(56,189,248,0.25); border-color: #38bdf8; color: #e0f2fe; }
+
+    /* Region filter bar */
+    .filter-bar { display: flex; justify-content: center; align-items: center; gap: 6px; padding: 0 12px 2px; flex-wrap: wrap; }
+    .filter-btn {
+      padding: 5px 16px; border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 14px; background: transparent;
+      color: rgba(255,255,255,0.5); font-size: 13px; font-weight: 500;
+      cursor: pointer; transition: all 0.15s; -webkit-tap-highlight-color: transparent;
+    }
+    .filter-btn.active { background: #0ea5e9; border-color: #0ea5e9; color: white; }
+    .filter-btn.compare-btn.active { background: #7c3aed; border-color: #7c3aed; }
+
+    /* Compare mode: two chip rows + two image rows */
+    .compare-view { display: none; flex: 1; flex-direction: column; min-height: 0; padding-top: 130px; }
+    .compare-view.open { display: flex; }
+    .compare-chip-section { padding: 6px 12px 8px; flex-shrink: 0; }
+    .compare-chip-label { font-size: 10px; font-weight: 700; letter-spacing: 0.05em; color: #94a3b8; margin-bottom: 4px; text-transform: uppercase; }
+    .compare-chip-row { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .compare-chip-row::-webkit-scrollbar { display: none; }
+    .compare-chip {
+      padding: 4px 10px; border: 1px solid rgba(255,255,255,0.2); border-radius: 10px;
+      background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.65); font-size: 11px;
+      cursor: pointer; white-space: nowrap; flex-shrink: 0; transition: all 0.15s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .compare-chip.active { background: rgba(56,189,248,0.25); border-color: #38bdf8; color: #e0f2fe; }
+    .compare-chip-row.top .compare-chip.active { background: rgba(56,189,248,0.3); }
+    .compare-chip-row.bottom .compare-chip.active { background: rgba(34,197,94,0.25); border-color: #22c55e; color: #dcfce7; }
+    .compare-images-half {
+      flex: 1; min-height: 0; display: flex; flex-direction: row; align-items: center;
+      gap: 6px; padding: 6px 10px; overflow-x: auto; overflow-y: hidden;
+      -webkit-overflow-scrolling: touch; border-bottom: 1px solid #1e293b;
+    }
+    .compare-images-half:last-child { border-bottom: none; }
+    .compare-img {
+      flex: 1 1 0; min-width: 0; width: 0; max-height: 100%;
+      object-fit: contain; cursor: pointer; border-radius: 3px;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .compare-img:active { opacity: 0.85; }
+
+    /* ── Single-image view ── */
+    .image-container {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      position: relative; overflow: hidden;
+    }
+    .image-container img { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+    /* ── Row view (all study images in one horizontal strip) ── */
+    .row-view {
+      flex: 1; display: none; flex-direction: row; align-items: stretch;
+      gap: 6px; padding: 130px 10px 10px;
+      overflow: hidden; background: #000;
+    }
+    .row-img {
+      flex: 1 1 0; min-width: 0; width: 0;
+      max-height: calc(100vh - 155px);
+      object-fit: contain; cursor: pointer;
+      border-radius: 3px; display: block;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .row-img:active { opacity: 0.85; }
+
+    /* MRI row view: 2×2 paginated grid */
+    .row-view.mri-view { align-items: stretch; overflow: hidden; gap: 0; }
+    .mri-nav-btn {
+      flex-shrink: 0; width: 44px; background: none; border: none;
+      color: rgba(255,255,255,0.35); cursor: pointer; padding: 0;
+      display: flex; align-items: center; justify-content: center;
+      transition: color 0.15s; -webkit-tap-highlight-color: transparent;
+    }
+    .mri-nav-btn:not([disabled]):hover { color: rgba(255,255,255,0.85); }
+    .mri-nav-btn[disabled] { opacity: 0.15; cursor: default; pointer-events: none; }
+    .mri-grid {
+      flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+      gap: 6px; min-height: 0; min-width: 0;
+    }
+    .mri-series-column {
+      display: flex; flex-direction: column;
+      overflow: hidden; border-radius: 6px; background: #0f172a;
+      min-height: 0; min-width: 0;
+    }
+    /* Flex context (compare view): restore sizing */
+    .compare-images-half.mri-half .mri-series-column {
+      flex: 1 1 0; min-width: 120px; max-width: 280px;
+    }
+    .mri-series-label {
+      flex-shrink: 0; padding: 5px 8px; font-size: 11px; font-weight: 600; color: #94a3b8;
+      background: #1e293b; border-bottom: 1px solid #334155;
+      display: flex; align-items: center; justify-content: space-between; gap: 4px;
+    }
+    .mri-series-label-text { flex: 1; text-align: center; }
+    .mri-slice-counter { font-size: 10px; color: #64748b; font-weight: 400; white-space: nowrap; }
+    .mri-stack-frame {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; min-height: 0; position: relative;
+    }
+    .mri-stack-img {
+      width: 100%; height: 100%; object-fit: contain; display: block;
+      cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    .mri-stack-img:active { opacity: 0.85; }
+    /* Compare half when it contains MRI columns */
+    .compare-images-half.mri-half {
+      flex-direction: row; align-items: stretch; gap: 6px; overflow-x: auto; overflow-y: hidden;
+    }
+
+    /* ── Nav arrows (single-image mode) ── */
+    .nav-overlay {
+      position: absolute; top: 0; bottom: 0; width: 70px;
+      display: flex; align-items: center; justify-content: center;
+      z-index: 5; opacity: 0; transition: opacity 0.2s; cursor: pointer;
+    }
+    .nav-overlay:active { opacity: 1; }
+    .nav-left { left: 0; } .nav-right { right: 0; }
+    .nav-arrow { color: rgba(255,255,255,0.7); display: flex; align-items: center; justify-content: center; }
+
+    /* ── Bottom thumbnail strip ── */
+    .bottom-bar {
+      position: absolute; bottom: 0; left: 0; right: 0; z-index: 10;
+      padding: 10px 14px;
+      background: linear-gradient(to top, rgba(0,0,0,0.75), transparent);
+      display: flex; justify-content: center; align-items: center; gap: 8px;
+    }
+    .thumb-strip { display: flex; gap: 5px; overflow-x: auto; -webkit-overflow-scrolling: touch; padding: 2px 0; scrollbar-width: none; }
+    .thumb-strip::-webkit-scrollbar { display: none; }
+    .thumb {
+      width: 52px; height: 52px; border-radius: 6px;
+      border: 2px solid transparent; object-fit: cover;
+      opacity: 0.55; flex-shrink: 0; cursor: pointer; transition: all 0.15s;
+    }
+    .thumb.active { border-color: #38bdf8; opacity: 1; }
+    .image-counter { font-size: 12px; color: #94a3b8; white-space: nowrap; }
+
+    /* ── Welcome ── */
+    .welcome { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #475569; }
+    .welcome svg { margin-bottom: 16px; }
+    .welcome h2 { font-size: 20px; font-weight: 500; color: #64748b; margin-bottom: 8px; }
+    .welcome p { font-size: 14px; }
+
+    /* ── Fullscreen overlay ── */
+    .fullscreen-overlay {
+      position: fixed; inset: 0; z-index: 200;
+      background: #000;
+      display: none; align-items: center; justify-content: center;
+    }
+    .fullscreen-overlay.open { display: flex; }
+    #fsImage { width: 100vw; height: 100vh; object-fit: contain; display: block; }
+    .fs-close {
+      position: absolute; top: 16px; right: 16px; z-index: 201;
+      width: 44px; height: 44px; border-radius: 50%;
+      background: rgba(255,255,255,0.15); border: none;
+      color: white; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .fs-nav {
+      position: absolute; top: 50%; transform: translateY(-50%); z-index: 201;
+      width: 48px; height: 80px; background: rgba(255,255,255,0.1); border: none;
+      color: white; border-radius: 8px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .fs-nav-left { left: 8px; } .fs-nav-right { right: 8px; }
+    .fs-counter {
+      position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,0.55); font-size: 13px; z-index: 201; white-space: nowrap;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 700px) {
+      .sidebar { position: absolute; top: 0; left: 0; bottom: 0; width: 260px; transform: translateX(-100%); margin-right: 0; }
+      .sidebar.open { transform: translateX(0); }
+    }
+
+    /* ── Snapshot view ── */
+    .snapshot-view {
+      flex: 1; display: flex; flex-direction: column; padding-top: 130px; min-height: 0;
+    }
+    .snapshot-xr-half {
+      flex: 0 0 40%; display: flex; flex-direction: row; align-items: stretch;
+      gap: 6px; padding: 8px 10px 4px; overflow: hidden; min-height: 0;
+    }
+    .snapshot-mri-half {
+      flex: 1; display: flex; flex-direction: row; align-items: stretch;
+      gap: 6px; padding: 4px 10px 10px; overflow: hidden; min-height: 0;
+    }
+    .snapshot-xr-half .row-img { flex: 1 1 0; min-width: 0; width: 0; object-fit: contain; cursor: pointer; }
+    .snapshot-mri-half .mri-series-column { flex: 1 1 0; min-width: 0; }
+    .snapshot-placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: #475569; font-size: 13px; }
+
+    /* ── Date group collapse ── */
+    .date-group { }
+    .date-header {
+      padding: 7px 16px 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.07em;
+      color: #38bdf8; text-transform: uppercase; background: #090f1c;
+      border-bottom: 1px solid #1e293b; position: sticky; top: 0; z-index: 1;
+      cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px;
+    }
+    .collapse-arrow { transition: transform 0.2s; flex-shrink: 0; }
+    .date-group.collapsed .collapse-arrow { transform: rotate(-90deg); }
+    .date-group.collapsed .patient-item { display: none; }
+    .date-patient-count { margin-left: auto; font-size: 10px; color: #475569; font-weight: 400; letter-spacing: 0; text-transform: none; }
+
+    /* ── Patient refresh button ── */
+    .patient-item { position: relative; }
+    .patient-item-inner { display: flex; align-items: flex-start; gap: 4px; }
+    .patient-item-content { flex: 1; min-width: 0; }
+    .patient-refresh-btn {
+      background: none; border: none; color: #334155; cursor: pointer;
+      padding: 4px; line-height: 0; border-radius: 4px; flex-shrink: 0; margin-top: 2px;
+      transition: color 0.15s; -webkit-tap-highlight-color: transparent;
+    }
+    .patient-refresh-btn:hover { color: #64748b; }
+    .patient-item.refresh-pending .patient-name::after { content: ' ↻'; display: inline-block; animation: spin 1s linear infinite; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+    /* Snapshot button style */
+    .snapshot-btn { }
+    .snapshot-btn.active { background: #059669; border-color: #059669; }
+
+    /* ── Date report button ── */
+    .date-report-btn {
+      background: none; border: none; color: #334155; cursor: pointer;
+      padding: 2px 4px; line-height: 0; border-radius: 4px; flex-shrink: 0; margin-left: 4px;
+      transition: color 0.15s; -webkit-tap-highlight-color: transparent;
+    }
+    .date-report-btn:hover { color: #94a3b8; }
+
+    /* ── Imaging Report modal ── */
+    .report-overlay {
+      position: fixed; inset: 0; z-index: 400;
+      background: rgba(0,0,0,0.72);
+      display: flex; align-items: center; justify-content: center;
+      padding: 16px;
+    }
+    .report-modal {
+      background: #0f172a; border: 1px solid #1e293b; border-radius: 14px;
+      width: min(680px, 100%); max-height: 88vh;
+      display: flex; flex-direction: column; overflow: hidden;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+    }
+    .report-modal-header {
+      padding: 14px 18px; border-bottom: 1px solid #1e293b;
+      display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+    }
+    .report-modal-title { font-size: 15px; font-weight: 600; color: #e2e8f0; }
+    .report-modal-actions { display: flex; align-items: center; gap: 8px; }
+    .report-copy-btn {
+      padding: 4px 10px; border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
+      background: rgba(255,255,255,0.06); color: #94a3b8; font-size: 11px; cursor: pointer;
+      transition: all 0.15s; -webkit-tap-highlight-color: transparent;
+    }
+    .report-copy-btn:hover { background: rgba(255,255,255,0.12); color: #e2e8f0; }
+    .report-copy-btn.copied { background: rgba(34,197,94,0.15); border-color: #22c55e; color: #22c55e; }
+    .report-close-btn {
+      background: none; border: none; color: #475569; cursor: pointer; padding: 4px;
+      line-height: 0; border-radius: 6px; transition: color 0.15s;
+    }
+    .report-close-btn:hover { color: #94a3b8; }
+    .report-body {
+      flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      padding: 12px 18px 18px;
+    }
+    .report-patient-block { padding: 10px 0; border-bottom: 1px solid #1e293b; }
+    .report-patient-block:last-child { border-bottom: none; }
+    .report-patient-name { font-size: 14px; font-weight: 600; color: #f1f5f9; }
+    .report-patient-dob { font-size: 11px; color: #475569; margin-top: 1px; margin-bottom: 8px; }
+    .report-study-row {
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 5px 0; border-bottom: 1px solid #0f1f35;
+    }
+    .report-study-row:last-child { border-bottom: none; }
+    .report-modality {
+      font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+      flex-shrink: 0; background: #1e293b; color: #64748b; letter-spacing: 0.03em;
+    }
+    .report-modality.mri { background: rgba(56,189,248,0.12); color: #38bdf8; }
+    .report-modality.ct  { background: rgba(234,179,8,0.12);  color: #ca8a04; }
+    .report-modality.xr  { background: rgba(34,197,94,0.12);  color: #22c55e; }
+    .report-study-desc { flex: 1; font-size: 12px; color: #cbd5e1; }
+    .report-study-meta { font-size: 11px; color: #475569; white-space: nowrap; }
+    .report-no-studies { font-size: 12px; color: #334155; font-style: italic; padding: 2px 0 4px; }
+    .report-loading { font-size: 13px; color: #475569; padding: 32px 0; text-align: center; }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Sidebar -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <h1>Clinic</h1>
+      <button type="button" onclick="toggleSidebar()" aria-label="Close sidebar">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="patient-list" id="patientList">
+      <div class="empty-state" id="emptyState">
+        <p>No preloaded images yet.<br>Use the Chrome extension to preload.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Viewer -->
+  <div class="viewer" id="viewer">
+
+    <!-- Header: toolbar + study chips + filters -->
+    <div class="viewer-header" id="viewerHeader">
+      <div class="toolbar-row">
+        <button type="button" class="toggle-sidebar" onclick="toggleSidebar()" aria-label="Open menu">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <div class="viewer-info">
+          <div class="viewer-patient-name" id="viewerPatientName"></div>
+          <div class="viewer-study-info"   id="viewerStudyInfo"></div>
+        </div>
+      </div>
+      <div class="study-bar" id="studyBar" style="display:none;"></div>
+      <div class="filter-bar" id="filterBar" style="display:none;">
+        <button class="filter-btn active" data-region="all"      onclick="setRegionFilter('all')">All</button>
+        <button class="filter-btn"        data-region="lumbar"   onclick="setRegionFilter('lumbar')">Lumbar</button>
+        <button class="filter-btn"        data-region="cervical" onclick="setRegionFilter('cervical')">Cervical</button>
+        <button class="filter-btn"        data-region="thoracic" onclick="setRegionFilter('thoracic')">Thoracic</button>
+        <button class="filter-btn compare-btn" id="compareBtn" onclick="toggleCompareMode()">Compare</button>
+        <button class="filter-btn snapshot-btn" id="snapshotBtn" onclick="toggleSnapshotMode()">Snapshot</button>
+      </div>
+      <!-- Compare mode: top/bottom chip rows (shown only in compare mode) -->
+      <div id="compareChipSection" style="display:none;">
+        <div class="compare-chip-section">
+          <div class="compare-chip-label">Top (most recent)</div>
+          <div class="compare-chip-row top" id="compareTopChips"></div>
+        </div>
+        <div class="compare-chip-section">
+          <div class="compare-chip-label">Bottom (older)</div>
+          <div class="compare-chip-row bottom" id="compareBottomChips"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Single-image view -->
+    <div class="image-container" id="imageContainer">
+      <div class="welcome" id="welcome">
+        <svg width="64" height="64" fill="none" viewBox="0 0 24 24" stroke="#475569" stroke-width="1.5">
+          <path d="M3 7h4l3-4h4l3 4h4v13H3V7z"/><circle cx="12" cy="14" r="4"/>
+        </svg>
+        <h2>PACS Viewer</h2>
+        <p>Select a patient from the sidebar</p>
+      </div>
+      <img id="mainImage" style="display:none;" alt="X-ray">
+      <div id="noResults" style="display:none; flex-direction:column; align-items:center; gap:10px; text-align:center; padding:40px 20px;">
+        <div style="font-size:16px; color:#64748b; font-weight:500;">No studies found</div>
+        <div id="noResultsMsg" style="font-size:13px; color:#475569;"></div>
+      </div>
+    </div>
+
+    <!-- Row view -->
+    <div class="row-view" id="rowView"></div>
+
+    <!-- Compare view: two rows of images -->
+    <div class="compare-view" id="compareView">
+      <div class="compare-images-half" id="compareTopImages"></div>
+      <div class="compare-images-half" id="compareBottomImages"></div>
+    </div>
+
+    <!-- Snapshot view: XR top + MRI bottom -->
+    <div class="snapshot-view" id="snapshotView" style="display:none;"></div>
+
+    <!-- Nav (single-image only) -->
+    <div class="nav-overlay nav-left"  onclick="prevImage()" role="button" aria-label="Previous image"><span class="nav-arrow"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></span></div>
+    <div class="nav-overlay nav-right" onclick="nextImage()" role="button" aria-label="Next image"><span class="nav-arrow"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></span></div>
+
+    <!-- Bottom thumbnails -->
+    <div class="bottom-bar" id="bottomBar" style="display:none;">
+      <div class="thumb-strip" id="thumbStrip"></div>
+      <div class="image-counter" id="imageCounter"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Fullscreen overlay -->
+<div class="fullscreen-overlay" id="fullscreenOverlay">
+  <button type="button" class="fs-close" onclick="closeFullscreen()" aria-label="Exit fullscreen">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+  </button>
+  <img id="fsImage" alt="">
+  <button type="button" class="fs-nav fs-nav-left"  onclick="fsNav(-1)" aria-label="Previous"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
+  <button type="button" class="fs-nav fs-nav-right" onclick="fsNav(1)" aria-label="Next"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></button>
+  <div class="fs-counter" id="fsCounter"></div>
+</div>
+
+<!-- Imaging Report modal -->
+<div class="report-overlay" id="reportOverlay" style="display:none;" onclick="if(event.target===this)closeReport()">
+  <div class="report-modal">
+    <div class="report-modal-header">
+      <span class="report-modal-title" id="reportTitle">Imaging Report</span>
+      <div class="report-modal-actions">
+        <button class="report-copy-btn" id="reportCopyBtn" onclick="copyReport()">Copy</button>
+        <button class="report-close-btn" onclick="closeReport()" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="report-body" id="reportBody"></div>
+  </div>
+</div>
+
+<script>
+  const API = window.location.origin;
+
+  // State
+  let allImages     = [];   // all images for current patient
+  let allStudies    = [];   // [{description, date}]
+  let filteredImages = [];  // after region filter
+  let currentIndex  = 0;
+  let activeRegion  = 'all';
+  let viewMode      = 'single'; // 'single' | 'row' | 'compare'
+  let compareTopStudyKey    = null;
+  let compareBottomStudyKey = null;
+
+  // Snapshot mode state
+  let snapshotPatientKey = null;
+
+  // Per-patient refresh tracking
+  const pendingRefreshKeys = new Set();
+
+  // Date group collapse state (persists across renderPatientList re-renders)
+  const collapsedDates = new Set();
+
+  // Patient summary list indexed by clinic date key — used by the report
+  let patientsByDate = {};
+
+  // Fullscreen state
+  let fsImages = [];
+  let fsIndex  = 0;
+
+  // Region keywords — allow generic 'spine' for lumbar so labels like "L-SPINEAP" still match
+  const REGION_KW = {
+    lumbar:   ['lumbar', 'lumbosacral', 'l-spine', 'l spine', 'spine', 'l1', 'l2', 'l3', 'l4', 'l5', 's1', 'sacrum', 'sacral', 'coccyx', 'scoliosis'],
+    cervical: ['cervical', 'c-spine', 'c spine', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'myelogram'],
+    thoracic: ['thoracic', 't-spine', 't spine', 't1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10', 't11', 't12'],
+  };
+
+  // ── Touch / Swipe (single-image mode) ──
+  let tx = 0, ty = 0, tt = 0;
+  document.getElementById('imageContainer').addEventListener('touchstart', e => {
+    tx = e.touches[0].clientX; ty = e.touches[0].clientY; tt = Date.now();
+  }, { passive: true });
+  document.getElementById('imageContainer').addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - tx;
+    const dy = e.changedTouches[0].clientY - ty;
+    const dt = Date.now() - tt;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 500) {
+      if (dx < 0) nextImage(); else prevImage();
+    }
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 200) toggleHeader();
+  }, { passive: true });
+
+  // Fullscreen touch swipe
+  let fsTx = 0;
+  document.getElementById('fullscreenOverlay').addEventListener('touchstart', e => {
+    fsTx = e.touches[0].clientX;
+  }, { passive: true });
+  document.getElementById('fullscreenOverlay').addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - fsTx;
+    if (Math.abs(dx) > 50) { if (dx < 0) fsNav(1); else fsNav(-1); }
+  }, { passive: true });
+
+  document.addEventListener('keydown', e => {
+    if (document.getElementById('fullscreenOverlay').classList.contains('open')) {
+      if (e.key === 'ArrowLeft') fsNav(-1);
+      if (e.key === 'ArrowRight') fsNav(1);
+      if (e.key === 'Escape') closeFullscreen();
+    } else {
+      if (e.key === 'ArrowLeft') prevImage();
+      if (e.key === 'ArrowRight') nextImage();
+    }
+  });
+
+  // ── Load Patients ──
+  async function loadPatients() {
+    try {
+      const resp = await fetch(`${API}/api/patients`);
+      const data = await resp.json();
+      // Clear pending refresh indicator when image count has grown (refresh fulfilled)
+      for (const p of data.patients) {
+        if (pendingRefreshKeys.has(p.key)) {
+          const prevEl = document.querySelector(`[data-key="${CSS.escape(p.key)}"] .patient-badge`);
+          const prevCount = prevEl ? parseInt(prevEl.textContent) : -1;
+          if (p.image_count > prevCount) pendingRefreshKeys.delete(p.key);
+        }
+      }
+      renderPatientList(data.patients);
+    } catch (e) { console.error('loadPatients:', e); }
+  }
+
+  function renderPatientList(patients) {
+    const list = document.getElementById('patientList');
+    const empty = document.getElementById('emptyState');
+    if (!patients.length) { empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+
+    // Group by clinic date, most recent first
+    const groups = {};
+    for (const p of patients) {
+      const dk = p.clinic_date || '';
+      if (!groups[dk]) groups[dk] = [];
+      groups[dk].push(p);
+    }
+    const sortedKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a));
+
+    // Auto-collapse past dates on first load (only if they haven't been manually toggled)
+    const todayIso = new Date().toISOString().slice(0, 10);
+    for (const dk of sortedKeys) {
+      if (dk && dk < todayIso && !collapsedDates.has(dk) && !collapsedDates.has('__expanded_' + dk)) {
+        collapsedDates.add(dk);
+      }
+    }
+
+    const refreshSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>`;
+    const arrowSvg = `<svg class="collapse-arrow" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>`;
+    const reportSvg = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`;
+
+    // Rebuild patient-by-date index for the report
+    patientsByDate = {};
+    for (const dk of sortedKeys) patientsByDate[dk] = groups[dk];
+
+    let html = '';
+    for (const dk of sortedKeys) {
+      const pts = groups[dk];
+      const isCollapsed = collapsedDates.has(dk);
+      const label = dk ? formatClinicDate(dk) : 'Unscheduled';
+      const countStr = `${pts.length} patient${pts.length !== 1 ? 's' : ''}`;
+      html += `<div class="date-group${isCollapsed ? ' collapsed' : ''}" data-date="${escAttr(dk)}">
+        <div class="date-header" onclick="toggleDateGroup('${escAttr(dk)}')">${arrowSvg}<span>${escHtml(label)}</span><span class="date-patient-count">${countStr}</span><button class="date-report-btn" title="Imaging report" onclick="event.stopPropagation(); openDateReport('${escAttr(dk)}')">${reportSvg}</button></div>`;
+      for (const p of pts) {
+        const isPending = pendingRefreshKeys.has(p.key);
+        html += `<div class="patient-item${isPending ? ' refresh-pending' : ''}" data-key="${escAttr(p.key)}" onclick="selectPatient('${escAttr(p.key)}')">
+          <div class="patient-item-inner">
+            <div class="patient-item-content">
+              <div class="patient-name">${escHtml(p.name)}</div>
+              <div class="patient-meta">DOB: ${escHtml(p.dob)}</div>
+              <span class="patient-badge">${p.image_count} image${p.image_count !== 1 ? 's' : ''} · ${p.study_count} study</span>
+            </div>
+            <button class="patient-refresh-btn" title="Request refresh" onclick="event.stopPropagation(); requestPatientRefresh('${escAttr(p.key)}')">${refreshSvg}</button>
+          </div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+    list.innerHTML = html;
+  }
+
+  function toggleDateGroup(dk) {
+    if (collapsedDates.has(dk)) {
+      collapsedDates.delete(dk);
+      collapsedDates.add('__expanded_' + dk); // mark as manually expanded
+    } else {
+      collapsedDates.delete('__expanded_' + dk);
+      collapsedDates.add(dk);
+    }
+    document.querySelector(`.date-group[data-date="${CSS.escape(dk)}"]`)?.classList.toggle('collapsed', collapsedDates.has(dk));
+  }
+
+  async function requestPatientRefresh(key) {
+    pendingRefreshKeys.add(key);
+    const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
+    if (el) el.classList.add('refresh-pending');
+    try {
+      await fetch(`${API}/api/patients/${encodeURIComponent(key)}/request-refresh`, { method: 'POST' });
+    } catch (e) { console.error('requestPatientRefresh:', e); }
+  }
+
+  // ── Select Patient ──
+  async function selectPatient(key) {
+    document.querySelectorAll('.patient-item').forEach(el => el.classList.remove('active'));
+    const el = document.querySelector(`[data-key="${key}"]`);
+    if (el) el.classList.add('active');
+
+    try {
+      const resp = await fetch(`${API}/api/patients/${key}`);
+      const data = await resp.json();
+
+      allImages  = [];
+      allStudies = [];
+
+      for (const [studyKey, study] of Object.entries(data.studies)) {
+        const desc = study.description || studyKey;
+        allStudies.push({ description: desc, date: study.date || '', key: studyKey });
+        const isMri = isMriStudy(desc);
+        const isCt  = isCtStudy(desc);
+        const sortedImages = [...(study.images || [])].sort((a, b) => {
+          if (isMri || isCt) {
+            const pa = parseSeriesFromFilename(a.filename), pb = parseSeriesFromFilename(b.filename);
+            if (pa && pb) {
+              const orderA = isMri ? getMriSeriesOrder(pa.seriesLabel) : getCtSeriesOrder(pa.seriesLabel);
+              const orderB = isMri ? getMriSeriesOrder(pb.seriesLabel) : getCtSeriesOrder(pb.seriesLabel);
+              if (orderA !== orderB) return orderA - orderB;
+              if (pa.seriesKey !== pb.seriesKey) return pa.seriesKey.localeCompare(pb.seriesKey);
+              return pa.sliceIndex - pb.sliceIndex;
+            }
+          }
+          const oa = viewOrderFromFilename(a.filename), ob = viewOrderFromFilename(b.filename);
+          if (oa !== ob) return oa - ob;
+          return (a.index ?? 0) - (b.index ?? 0);
+        });
+        for (const img of sortedImages) {
+          const entry = {
+            url:      `${API}/api/images/${key}/${img.filename}`,
+            study:    desc,
+            date:     study.date || '',
+            studyKey: studyKey,
+          };
+          if (isMri || isCt) {
+            const parsed = parseSeriesFromFilename(img.filename);
+            if (parsed) {
+              entry.seriesKey = parsed.seriesKey;
+              entry.seriesLabel = parsed.seriesLabel;
+              entry.sliceIndex = parsed.sliceIndex;
+            }
+          }
+          allImages.push(entry);
+        }
+      }
+
+      document.getElementById('viewerPatientName').textContent = data.name;
+      document.getElementById('welcome').style.display   = 'none';
+      document.getElementById('mainImage').style.display = 'block';
+      document.getElementById('studyBar').style.display  = 'flex';
+      document.getElementById('filterBar').style.display = 'flex';
+      snapshotPatientKey = key;
+      if (viewMode === 'compare') {
+        exitCompareMode();
+        document.getElementById('compareBtn').classList.remove('active');
+      }
+      viewMode = 'single'; // reset so toggleSnapshotMode always enters snapshot
+
+      renderStudyBar();
+      currentIndex = 0;
+      applyRegionFilter();
+      toggleSnapshotMode();
+
+      if (window.innerWidth <= 700) document.getElementById('sidebar').classList.remove('open');
+    } catch (e) { console.error('selectPatient:', e); }
+  }
+
+  // ── Study Bar ──
+  function renderStudyBar() {
+    const bar = document.getElementById('studyBar');
+    bar.innerHTML = allStudies.map(s => {
+      const label = s.description.split(' - ')[0];
+      const dateStr = s.date ? `<br><span style="font-size:10px;opacity:0.6">${escHtml(formatStudyDate(s.date))}</span>` : '';
+      return `<button class="study-btn" data-studykey="${escAttr(s.key)}"
+                onclick="openStudyRow('${escAttr(s.key)}')">${escHtml(label)}${dateStr}</button>`;
+    }).join('');
+    updateStudyBarVisibility();
+  }
+
+  function highlightStudyBtn(studyKey) {
+    document.querySelectorAll('.study-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.studykey === studyKey);
+    });
+  }
+
+  function formatStudyDate(d) {
+    // YYYYMMDD → MM/DD/YYYY
+    if (/^\d{8}$/.test(d)) return `${d.slice(4,6)}/${d.slice(6,8)}/${d.slice(0,4)}`;
+    return d;
+  }
+
+  function formatClinicDate(d) {
+    // "2026-02-22" (from date input) → "Feb 22, 2026"
+    if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+      const [y, m, day] = d.split('-');
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      return `${months[parseInt(m) - 1]} ${parseInt(day)}, ${y}`;
+    }
+    return d;
+  }
+
+  // View order for sorting: AP first, then lateral, then other (from filename/series description)
+  function viewOrderFromFilename(filename) {
+    const f = (filename || '').toLowerCase();
+    if (/_ap_|_ap\.|\bap\b/.test(f)) return 0;
+    if (/lateral|_lat_|_lat\.|\blat\b/.test(f)) return 1;
+    return 2;
+  }
+
+  // MRI: study description starts with MR/MRI
+  function isMriStudy(studyDescription) {
+    return /^(MR|MRI)[\s\-]/i.test(studyDescription || '');
+  }
+
+  // CT: study description starts with CT
+  function isCtStudy(studyDescription) {
+    return /^CT[\s\-]/i.test(studyDescription || '');
+  }
+
+  // XR/CR/DX/RF: plain radiograph
+  function isXrStudy(studyDescription) {
+    return /^(XR|CR|DX|RF|L_SPINE|DX\-|L SPINE)[\s\-_]/i.test(studyDescription || '');
+  }
+
+  // Parse filename pattern: prefix_index_hex.jpg -> { seriesKey, seriesLabel, sliceIndex }
+  const MRI_FILENAME_RE = /^(.+)_(\d+)_[a-f0-9]+\.jpg$/i;
+  function parseSeriesFromFilename(filename) {
+    const m = (filename || '').match(MRI_FILENAME_RE);
+    if (!m) return null;
+    const seriesKey = m[1];
+    const sliceIndex = parseInt(m[2], 10);
+    const afterDash = seriesKey.split('_-_').pop() || seriesKey;
+    const seriesLabel = afterDash.replace(/_/g, ' ').trim() || seriesKey;
+    return { seriesKey, seriesLabel, sliceIndex };
+  }
+
+  // CT series order: 0 Axial, 1 Sagittal, 2 Coronal, 9 other
+  function getCtSeriesOrder(seriesLabel) {
+    const L = (seriesLabel || '').toLowerCase();
+    if (/\bax\b|axial/.test(L)) return 0;
+    if (/\bsag\b|sagittal/.test(L)) return 1;
+    if (/\bcor\b|coronal/.test(L)) return 2;
+    return 9;
+  }
+
+  // MRI series order: 0 sag T2, 1 ax T2, 2 sag STIR, 3 sag T1, 9 other
+  function getMriSeriesOrder(seriesLabel) {
+    const L = (seriesLabel || '').toLowerCase().replace(/[^\w\s]/g, '');
+    const hasSag = /\bsag\b/.test(L);
+    const hasAx = /\bax\b/.test(L) || /axial/.test(L);
+    const hasT2 = /\bt2\b/.test(L);
+    const hasStir = /\bstir\b/.test(L);
+    const hasT1 = /\bt1\b/.test(L);
+    if (hasSag && hasT2) return 0;
+    if (hasAx && hasT2) return 1;
+    if (hasSag && hasStir) return 2;
+    if (hasSag && hasT1) return 3;
+    return 9;
+  }
+
+  // For a given CT study, return ordered series: [{ seriesKey, seriesLabel, orderRank, images, middleIndex }]
+  function getCtSeriesForStudy(studyKey) {
+    const imgs = allImages.filter(img => img.studyKey === studyKey && img.seriesKey);
+    const bySeries = {};
+    for (const img of imgs) {
+      if (!bySeries[img.seriesKey]) bySeries[img.seriesKey] = { seriesKey: img.seriesKey, seriesLabel: img.seriesLabel || img.seriesKey, images: [] };
+      bySeries[img.seriesKey].images.push(img);
+    }
+    const seriesList = Object.values(bySeries).map(s => {
+      s.images.sort((a, b) => (a.sliceIndex ?? 0) - (b.sliceIndex ?? 0));
+      s.orderRank = getCtSeriesOrder(s.seriesLabel);
+      s.middleIndex = Math.floor(s.images.length / 2);
+      s.scrollToIndex = s.middleIndex;
+      return s;
+    });
+    seriesList.sort((a, b) => a.orderRank - b.orderRank || a.seriesLabel.localeCompare(b.seriesLabel));
+    return seriesList;
+  }
+
+  // For a given MRI study, return ordered series: [{ seriesKey, seriesLabel, orderRank, images, middleIndex }]
+  function getMriSeriesForStudy(studyKey) {
+    const imgs = allImages.filter(img => img.studyKey === studyKey && img.seriesKey);
+    const bySeries = {};
+    for (const img of imgs) {
+      if (!bySeries[img.seriesKey]) bySeries[img.seriesKey] = { seriesKey: img.seriesKey, seriesLabel: img.seriesLabel || img.seriesKey, images: [] };
+      bySeries[img.seriesKey].images.push(img);
+    }
+    const seriesList = Object.values(bySeries).map(s => {
+      s.images.sort((a, b) => (a.sliceIndex ?? 0) - (b.sliceIndex ?? 0));
+      s.orderRank = getMriSeriesOrder(s.seriesLabel);
+      s.middleIndex = Math.floor(s.images.length / 2);
+      const isSagittal = /\bsag\b/i.test(s.seriesLabel || '');
+      s.scrollToIndex = isSagittal ? s.middleIndex : 0;
+      return s;
+    });
+    seriesList.sort((a, b) => a.orderRank - b.orderRank || a.seriesLabel.localeCompare(b.seriesLabel));
+    return seriesList;
+  }
+
+  // Filtered studies for current region, sorted by date descending (most recent first)
+  function getFilteredStudyKeysByDate() {
+    const matched = allStudies.filter(s => studyMatchesRegion(s.description, activeRegion));
+    return matched.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  }
+
+  // ── Compare mode ──
+  function toggleCompareMode() {
+    const btn = document.getElementById('compareBtn');
+    if (viewMode === 'compare') {
+      exitCompareMode();
+      btn.classList.remove('active');
+      return;
+    }
+    const ordered = getFilteredStudyKeysByDate();
+    if (ordered.length === 0) return;
+    viewMode = 'compare';
+    compareTopStudyKey = ordered[0].key;
+    compareBottomStudyKey = ordered.length > 1 ? ordered[ordered.length - 1].key : ordered[0].key;
+    btn.classList.add('active');
+    document.getElementById('studyBar').style.display = 'none';
+    document.getElementById('compareChipSection').style.display = 'block';
+    document.getElementById('imageContainer').style.display = 'none';
+    document.getElementById('rowView').style.display = 'none';
+    document.getElementById('bottomBar').style.display = 'none';
+    document.querySelectorAll('.nav-overlay').forEach(el => el.style.display = 'none');
+    document.getElementById('compareView').classList.add('open');
+    renderCompareChips();
+    renderCompareImages();
+  }
+
+  function exitCompareMode() {
+    viewMode = 'single';
+    document.getElementById('compareView').classList.remove('open');
+    document.getElementById('compareChipSection').style.display = 'none';
+    document.getElementById('studyBar').style.display = 'flex';
+    document.querySelectorAll('.nav-overlay').forEach(el => el.style.display = '');
+    showSingleView();
+  }
+
+  // ── Snapshot mode ──
+  function toggleSnapshotMode() {
+    if (viewMode === 'snapshot') { exitSnapshotMode(); return; }
+    if (!snapshotPatientKey) return;
+    if (viewMode === 'compare') {
+      exitCompareMode();
+      document.getElementById('compareBtn').classList.remove('active');
+    }
+    viewMode = 'snapshot';
+    document.getElementById('snapshotBtn').classList.add('active');
+    document.getElementById('imageContainer').style.display = 'none';
+    document.getElementById('rowView').style.display = 'none';
+    document.getElementById('compareView').classList.remove('open');
+    document.getElementById('bottomBar').style.display = 'none';
+    document.querySelectorAll('.nav-overlay').forEach(el => el.style.display = 'none');
+    document.getElementById('snapshotView').style.display = 'flex';
+    renderSnapshotView();
+  }
+
+  function exitSnapshotMode() {
+    viewMode = 'single';
+    document.getElementById('snapshotBtn').classList.remove('active');
+    document.getElementById('snapshotView').style.display = 'none';
+    document.querySelectorAll('.nav-overlay').forEach(el => el.style.display = '');
+    showSingleView();
+  }
+
+  function renderSnapshotView() {
+    const sv = document.getElementById('snapshotView');
+
+    // Find most recent XR study matching activeRegion
+    const xrStudies = allStudies.filter(s =>
+      (isXrStudy(s.description) || (!isMriStudy(s.description) && !isCtStudy(s.description))) &&
+      studyMatchesRegion(s.description, activeRegion)
+    ).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    const xrStudy = xrStudies[0] || null;
+
+    // Find most recent MRI study matching activeRegion
+    const mriStudies = allStudies.filter(s =>
+      isMriStudy(s.description) && studyMatchesRegion(s.description, activeRegion)
+    ).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    const mriStudy = mriStudies[0] || null;
+
+    // Build XR half
+    let xrHtml = '';
+    if (xrStudy) {
+      const xrImgs = allImages.filter(img => img.studyKey === xrStudy.key);
+      if (xrImgs.length > 0) {
+        xrHtml = `<div class="snapshot-xr-half">${
+          xrImgs.map((img, i) =>
+            `<img class="row-img" src="${escHtml(img.url)}" alt="${i + 1}" loading="lazy">`
+          ).join('')
+        }</div>`;
+      }
+    }
+    if (!xrHtml) {
+      xrHtml = `<div class="snapshot-xr-half"><div class="snapshot-placeholder">No X-ray study found for this region</div></div>`;
+    }
+
+    // Build MRI half — prefer ranks 0 (Sag T2), 1 (Ax T2), 2 (Sag STIR)
+    let mriHtml = '';
+    if (mriStudy) {
+      const seriesList = getMriSeriesForStudy(mriStudy.key);
+      const wanted = seriesList.filter(s => s.orderRank <= 2).slice(0, 3);
+      if (wanted.length > 0) {
+        mriHtml = `<div class="snapshot-mri-half" id="snapshotMriHalf">${
+          wanted.map(ser => {
+            const mid = ser.middleIndex;
+            return `<div class="mri-series-column">
+              <div class="mri-series-label">
+                <span class="mri-series-label-text">${escHtml(ser.seriesLabel)}</span>
+                <span class="mri-slice-counter">${mid + 1}/${ser.images.length}</span>
+              </div>
+              <div class="mri-stack-frame">
+                <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+              </div>
+            </div>`;
+          }).join('')
+        }</div>`;
+      }
+    }
+    if (!mriHtml) {
+      mriHtml = `<div class="snapshot-mri-half"><div class="snapshot-placeholder">No MRI study found for this region</div></div>`;
+    }
+
+    sv.innerHTML = xrHtml + mriHtml;
+
+    // Wire up XR image click → fullscreen
+    if (xrStudy) {
+      const xrImgs = allImages.filter(img => img.studyKey === xrStudy.key);
+      sv.querySelectorAll('.snapshot-xr-half .row-img').forEach((imgEl, i) => {
+        imgEl.addEventListener('click', () => openFullscreen(xrImgs, i));
+      });
+    }
+
+    // Wire up MRI columns
+    if (mriStudy) {
+      const seriesList = getMriSeriesForStudy(mriStudy.key);
+      const wanted = seriesList.filter(s => s.orderRank <= 2).slice(0, 3);
+      sv.querySelectorAll('.snapshot-mri-half .mri-series-column').forEach((colEl, i) => {
+        if (wanted[i]) setupMriColumn(colEl, wanted[i].images, wanted[i].middleIndex);
+      });
+    }
+  }
+
+  function setCompareTop(studyKey) {
+    compareTopStudyKey = studyKey;
+    renderCompareChips();
+    renderCompareImages();
+  }
+
+  function setCompareBottom(studyKey) {
+    compareBottomStudyKey = studyKey;
+    renderCompareChips();
+    renderCompareImages();
+  }
+
+  function renderCompareChips() {
+    const ordered = getFilteredStudyKeysByDate();
+    const topRow = document.getElementById('compareTopChips');
+    const bottomRow = document.getElementById('compareBottomChips');
+    topRow.innerHTML = ordered.map(s => {
+      const label = s.description.split(' - ')[0];
+      const dateStr = s.date ? ` (${formatStudyDate(s.date)})` : '';
+      const active = s.key === compareTopStudyKey;
+      return `<button type="button" class="compare-chip ${active ? 'active' : ''}" data-studykey="${escAttr(s.key)}" onclick="setCompareTop('${escAttr(s.key)}')">${escHtml(label)}${escHtml(dateStr)}</button>`;
+    }).join('');
+    bottomRow.innerHTML = ordered.map(s => {
+      const label = s.description.split(' - ')[0];
+      const dateStr = s.date ? ` (${formatStudyDate(s.date)})` : '';
+      const active = s.key === compareBottomStudyKey;
+      return `<button type="button" class="compare-chip ${active ? 'active' : ''}" data-studykey="${escAttr(s.key)}" onclick="setCompareBottom('${escAttr(s.key)}')">${escHtml(label)}${escHtml(dateStr)}</button>`;
+    }).join('');
+  }
+
+  function renderCompareImages() {
+    const topStudyDesc = compareTopStudyKey ? (allStudies.find(s => s.key === compareTopStudyKey)?.description || '') : '';
+    const bottomStudyDesc = compareBottomStudyKey ? (allStudies.find(s => s.key === compareBottomStudyKey)?.description || '') : '';
+    const topImgs = compareTopStudyKey ? allImages.filter(img => img.studyKey === compareTopStudyKey) : [];
+    const bottomImgs = compareBottomStudyKey ? allImages.filter(img => img.studyKey === compareBottomStudyKey) : [];
+    const topEl = document.getElementById('compareTopImages');
+    const bottomEl = document.getElementById('compareBottomImages');
+
+    function renderCompareHalf(el, studyKey, studyDesc, imgs, arrayName) {
+      const isSeriesStudy = (isMriStudy(studyDesc) || isCtStudy(studyDesc)) && studyKey;
+      if (isSeriesStudy) {
+        const seriesList = isMriStudy(studyDesc) ? getMriSeriesForStudy(studyKey) : getCtSeriesForStudy(studyKey);
+        if (seriesList.length === 0) {
+          el.classList.remove('mri-half');
+          el.innerHTML = imgs.map((img, i) =>
+            `<img class="compare-img" src="${escHtml(img.url)}" alt="${i + 1}" loading="lazy" onclick="openFullscreen(window.${arrayName}, ${i})">`
+          ).join('');
+          window[arrayName] = imgs;
+          return;
+        }
+        el.classList.add('mri-half');
+        el.innerHTML = seriesList.map(ser => {
+          const mid = ser.middleIndex;
+          return `<div class="mri-series-column">
+            <div class="mri-series-label">
+              <span class="mri-series-label-text">${escHtml(ser.seriesLabel)}</span>
+              <span class="mri-slice-counter">${mid + 1}/${ser.images.length}</span>
+            </div>
+            <div class="mri-stack-frame">
+              <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+            </div>
+          </div>`;
+        }).join('');
+        window[arrayName] = seriesList.map(s => s.images);
+        el.querySelectorAll('.mri-series-column').forEach((colEl, si) => {
+          setupMriColumn(colEl, seriesList[si].images, seriesList[si].middleIndex);
+        });
+      } else {
+        el.classList.remove('mri-half');
+        el.innerHTML = imgs.map((img, i) =>
+          `<img class="compare-img" src="${escHtml(img.url)}" alt="${i + 1}" loading="lazy" onclick="openFullscreen(window.${arrayName}, ${i})">`
+        ).join('');
+        window[arrayName] = imgs;
+      }
+    }
+
+    renderCompareHalf(topEl, compareTopStudyKey, topStudyDesc, topImgs, 'compareTopImagesArray');
+    renderCompareHalf(bottomEl, compareBottomStudyKey, bottomStudyDesc, bottomImgs, 'compareBottomImagesArray');
+  }
+
+  // ── Row View (chip clicked) ──
+  function openStudyRow(studyKey) {
+    viewMode = 'row';
+    highlightStudyBtn(studyKey);
+
+    // Hide single-image nav overlays — they sit at z-index 5, position:absolute,
+    // covering the left/right 70px and would block the MRI pagination buttons.
+    document.querySelectorAll('.nav-overlay').forEach(el => el.style.display = 'none');
+
+    const studyObj = allStudies.find(s => s.key === studyKey);
+    const studyDesc = studyObj ? studyObj.description : studyKey;
+    const imgs = allImages.filter(img => img.studyKey === studyKey);
+    const rowView = document.getElementById('rowView');
+
+    if (isMriStudy(studyDesc) || isCtStudy(studyDesc)) {
+      const seriesList = isMriStudy(studyDesc) ? getMriSeriesForStudy(studyKey) : getCtSeriesForStudy(studyKey);
+      if (seriesList.length === 0) {
+        rowView.classList.remove('mri-view');
+        rowView.innerHTML = imgs.map((img, i) => `
+          <img class="row-img" src="${escHtml(img.url)}" alt="${i + 1}"
+               loading="lazy" onclick="openFullscreen(currentStudyImages, ${i})">`
+        ).join('');
+        window.currentStudyImages = imgs;
+        rowView.style.display = 'flex';
+        document.getElementById('imageContainer').style.display = 'none';
+        document.getElementById('bottomBar').style.display = 'none';
+        document.getElementById('viewerStudyInfo').textContent =
+          `${studyDesc.split(' - ')[0]}  ·  ${imgs.length} image${imgs.length !== 1 ? 's' : ''}`;
+        return;
+      }
+      rowView.classList.add('mri-view');
+      window.mriActiveSeries = seriesList;
+      window.mriPage = 0;
+      const navL = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>`;
+      const navR = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>`;
+      rowView.innerHTML = `<button class="mri-nav-btn" id="mriNavPrev" onclick="mriNavPrev()" aria-label="Previous series">${navL}</button><div class="mri-grid" id="mriGrid"></div><button class="mri-nav-btn" id="mriNavNext" onclick="mriNavNext()" aria-label="Next series">${navR}</button>`;
+      renderMriPageGrid();
+      rowView.style.display = 'flex';
+      document.getElementById('imageContainer').style.display = 'none';
+      document.getElementById('bottomBar').style.display = 'none';
+      document.getElementById('viewerStudyInfo').textContent =
+        `${studyDesc.split(' - ')[0]}  ·  ${seriesList.length} series`;
+    } else {
+      rowView.classList.remove('mri-view');
+      rowView.innerHTML = imgs.map((img, i) => `
+        <img class="row-img" src="${escHtml(img.url)}" alt="${i + 1}"
+             loading="lazy" onclick="openFullscreen(currentStudyImages, ${i})">`
+      ).join('');
+      window.currentStudyImages = imgs;
+      rowView.style.display = 'flex';
+      document.getElementById('imageContainer').style.display = 'none';
+      document.getElementById('bottomBar').style.display = 'none';
+      document.getElementById('viewerStudyInfo').textContent =
+        `${studyDesc.split(' - ')[0]}  ·  ${imgs.length} image${imgs.length !== 1 ? 's' : ''}`;
+    }
+  }
+
+  const MRI_PAGE_SIZE = 4;
+
+  function mriNavPrev() {
+    if (window.mriPage > 0) { window.mriPage--; renderMriPageGrid(); }
+  }
+  function mriNavNext() {
+    if ((window.mriPage + 1) * MRI_PAGE_SIZE < (window.mriActiveSeries || []).length) {
+      window.mriPage++; renderMriPageGrid();
+    }
+  }
+  function renderMriPageGrid() {
+    const grid = document.getElementById('mriGrid');
+    if (!grid) return;
+    const series = window.mriActiveSeries || [];
+    const start = window.mriPage * MRI_PAGE_SIZE;
+    const page = series.slice(start, start + MRI_PAGE_SIZE);
+    const count = page.length;
+    grid.style.gridTemplateColumns = count >= 2 ? '1fr 1fr' : '1fr';
+    grid.style.gridTemplateRows = count >= 3 ? '1fr 1fr' : '1fr';
+    grid.innerHTML = page.map(ser => {
+      const mid = ser.middleIndex;
+      return `<div class="mri-series-column">
+        <div class="mri-series-label">
+          <span class="mri-series-label-text">${escHtml(ser.seriesLabel)}</span>
+          <span class="mri-slice-counter">${mid + 1}/${ser.images.length}</span>
+        </div>
+        <div class="mri-stack-frame">
+          <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+        </div>
+      </div>`;
+    }).join('');
+    grid.querySelectorAll('.mri-series-column').forEach((colEl, i) => {
+      setupMriColumn(colEl, page[i].images, page[i].middleIndex);
+    });
+    const prevBtn = document.getElementById('mriNavPrev');
+    const nextBtn = document.getElementById('mriNavNext');
+    if (prevBtn) prevBtn.disabled = window.mriPage === 0;
+    if (nextBtn) nextBtn.disabled = start + MRI_PAGE_SIZE >= series.length;
+  }
+
+  function setupMriColumn(colEl, images, initialIndex) {
+    const imgEl = colEl.querySelector('.mri-stack-img');
+    const counterEl = colEl.querySelector('.mri-slice-counter');
+    let currentIdx = Math.max(0, Math.min(initialIndex, images.length - 1));
+
+    function setSlice(idx) {
+      currentIdx = Math.max(0, Math.min(idx, images.length - 1));
+      imgEl.src = images[currentIdx].url;
+      imgEl.alt = String(currentIdx + 1);
+      if (counterEl) counterEl.textContent = `${currentIdx + 1}/${images.length}`;
+    }
+
+    imgEl.addEventListener('click', () => openFullscreen(images, currentIdx));
+
+    // Mouse wheel: scroll through slices
+    colEl.addEventListener('wheel', e => {
+      e.preventDefault();
+      if (e.deltaY > 0) setSlice(currentIdx + 1);
+      else if (e.deltaY < 0) setSlice(currentIdx - 1);
+    }, { passive: false });
+
+    // Touch swipe up/down: scroll through slices
+    let touchStartY = 0;
+    colEl.addEventListener('touchstart', e => {
+      touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+    colEl.addEventListener('touchend', e => {
+      const dy = touchStartY - e.changedTouches[0].clientY;
+      if (Math.abs(dy) > 25) setSlice(currentIdx + (dy > 0 ? 1 : -1));
+    }, { passive: true });
+
+    setSlice(currentIdx);
+  }
+
+  function showSingleView() {
+    viewMode = 'single';
+    document.getElementById('rowView').style.display = 'none';
+    document.getElementById('imageContainer').style.display = 'flex';
+    document.getElementById('bottomBar').style.display = 'flex';
+    document.querySelectorAll('.study-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.nav-overlay').forEach(el => el.style.display = '');
+  }
+
+  // ── Region Filter ──
+  function setRegionFilter(region) {
+    if (viewMode === 'compare') {
+      exitCompareMode();
+      document.getElementById('compareBtn').classList.remove('active');
+    }
+    if (viewMode === 'snapshot') {
+      exitSnapshotMode();
+    }
+    activeRegion = region;
+    document.querySelectorAll('.filter-btn').forEach(b => {
+      if (b.classList.contains('compare-btn') || b.classList.contains('snapshot-btn')) return;
+      b.classList.toggle('active', b.dataset.region === region);
+    });
+    showSingleView();
+    currentIndex = 0;
+    applyRegionFilter();
+  }
+
+  function studyMatchesRegion(studyDesc, region) {
+    if (region === 'all') return true;
+    const kws = REGION_KW[region] || [];
+    const base = (studyDesc || '').split(' - ')[0].toLowerCase();
+    return kws.some(kw => base.includes(kw));
+  }
+
+  function updateStudyBarVisibility() {
+    const buttons = document.querySelectorAll('.study-btn');
+    buttons.forEach(btn => {
+      const key = btn.dataset.studykey;
+      const s = allStudies.find(st => st.key === key);
+      if (!s) return;
+      const visible = studyMatchesRegion(s.description, activeRegion);
+      btn.style.display = visible ? '' : 'none';
+    });
+  }
+
+  function applyRegionFilter() {
+    if (activeRegion === 'all') {
+      filteredImages = allImages.slice();
+    } else {
+      const kws = REGION_KW[activeRegion] || [];
+      filteredImages = allImages.filter(img => {
+        // Only match on the study description BEFORE any " - " series suffix
+        // (series description can be contaminated by nearby strings in the GWT table)
+        const base = (img.study || '').split(' - ')[0].toLowerCase();
+        return kws.some(kw => base.includes(kw));
+      });
+    }
+
+    updateStudyBarVisibility();
+
+    const noResults = document.getElementById('noResults');
+    if (filteredImages.length > 0) {
+      noResults.style.display = 'none';
+      document.getElementById('mainImage').style.display = 'block';
+      document.getElementById('bottomBar').style.display = 'flex';
+      showImage(0);
+      renderThumbs();
+    } else {
+      document.getElementById('mainImage').style.display = 'none';
+      document.getElementById('bottomBar').style.display = 'none';
+      document.getElementById('viewerStudyInfo').textContent = 'No studies found';
+      document.getElementById('imageCounter').textContent = '';
+      document.getElementById('thumbStrip').innerHTML = '';
+      noResults.style.display = 'flex';
+      document.getElementById('noResultsMsg').textContent =
+        activeRegion === 'all'
+          ? 'No images preloaded for this patient'
+          : `No ${activeRegion} spine studies found`;
+    }
+  }
+
+  // ── Single-image Navigation ──
+  function showImage(index) {
+    if (!filteredImages.length) return;
+    currentIndex = Math.max(0, Math.min(index, filteredImages.length - 1));
+    document.getElementById('mainImage').src = filteredImages[currentIndex].url;
+    document.getElementById('viewerStudyInfo').textContent =
+      `${filteredImages[currentIndex].study.split(' - ')[0]}  ·  ${currentIndex + 1} / ${filteredImages.length}`;
+    document.getElementById('imageCounter').textContent =
+      `${currentIndex + 1} / ${filteredImages.length}`;
+    document.querySelectorAll('.thumb').forEach((t, i) => t.classList.toggle('active', i === currentIndex));
+  }
+
+  function nextImage() { if (currentIndex < filteredImages.length - 1) showImage(currentIndex + 1); }
+  function prevImage() { if (currentIndex > 0) showImage(currentIndex - 1); }
+
+  function renderThumbs() {
+    document.getElementById('thumbStrip').innerHTML = filteredImages.map((img, i) => `
+      <img class="thumb ${i === 0 ? 'active' : ''}" src="${escHtml(img.url)}" alt="${i + 1}"
+           onclick="openFullscreen(filteredImages, ${i})">`
+    ).join('');
+  }
+
+  // ── Fullscreen ──
+  function openFullscreen(images, index) {
+    fsImages = Array.isArray(images) ? images : filteredImages;
+    fsIndex  = index;
+    document.getElementById('fsImage').src = fsImages[fsIndex].url || fsImages[fsIndex];
+    updateFsCounter();
+    document.getElementById('fullscreenOverlay').classList.add('open');
+  }
+
+  function closeFullscreen() {
+    document.getElementById('fullscreenOverlay').classList.remove('open');
+  }
+
+  function fsNav(dir) {
+    fsIndex = Math.max(0, Math.min(fsIndex + dir, fsImages.length - 1));
+    document.getElementById('fsImage').src = fsImages[fsIndex].url || fsImages[fsIndex];
+    updateFsCounter();
+  }
+
+  function updateFsCounter() {
+    const img = fsImages[fsIndex];
+    const study = img.study ? img.study.split(' - ')[0] : '';
+    document.getElementById('fsCounter').textContent =
+      `${study ? study + '  ·  ' : ''}${fsIndex + 1} / ${fsImages.length}`;
+  }
+
+  // ── UI ──
+  function toggleSidebar() {
+    const sb = document.getElementById('sidebar');
+    if (window.innerWidth <= 700) sb.classList.toggle('open');
+    else sb.classList.toggle('collapsed');
+  }
+
+  function toggleHeader() {
+    document.getElementById('viewerHeader').classList.toggle('hidden');
+    const bb = document.getElementById('bottomBar');
+    if (bb.style.display !== 'none') bb.classList.toggle('hidden');
+  }
+
+  function escHtml(s) {
+    const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML;
+  }
+  function escAttr(s) {
+    return (s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  }
+
+  // ── Imaging Report ──
+  function studyModalityLabel(desc) {
+    if (/^(MR|MRI)[\s\-]/i.test(desc)) return 'MRI';
+    if (/^CT[\s\-]/i.test(desc)) return 'CT';
+    return 'XR';
+  }
+
+  function isSpineStudy(desc) {
+    const base = (desc || '').split(' - ')[0].toLowerCase();
+    const allKws = [...(REGION_KW.lumbar || []), ...(REGION_KW.cervical || []), ...(REGION_KW.thoracic || [])];
+    return allKws.some(kw => base.includes(kw));
+  }
+
+  async function openDateReport(dk) {
+    const label = dk ? formatClinicDate(dk) : 'Unscheduled';
+    document.getElementById('reportTitle').textContent = `Imaging Report — ${label}`;
+    document.getElementById('reportBody').innerHTML = '<div class="report-loading">Loading…</div>';
+    document.getElementById('reportCopyBtn').textContent = 'Copy';
+    document.getElementById('reportCopyBtn').classList.remove('copied');
+    document.getElementById('reportOverlay').style.display = 'flex';
+
+    const patients = patientsByDate[dk] || [];
+
+    // Fetch full study details for all patients in parallel
+    const results = await Promise.all(patients.map(async p => {
+      try {
+        const resp = await fetch(`${API}/api/patients/${encodeURIComponent(p.key)}`);
+        const data = await resp.json();
+        return { p, studies: data.studies };
+      } catch (e) { return { p, studies: null }; }
+    }));
+
+    let html = '';
+    for (const { p, studies } of results) {
+      html += `<div class="report-patient-block">
+        <div class="report-patient-name">${escHtml(p.name)}</div>
+        <div class="report-patient-dob">DOB: ${escHtml(p.dob)}</div>`;
+
+      if (!studies) {
+        html += `<div class="report-no-studies">Error loading studies</div>`;
+      } else {
+        const studyList = Object.values(studies)
+          .filter(s => isSpineStudy(s.description || ''))
+          .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+        if (studyList.length === 0) {
+          html += `<div class="report-no-studies">No spine studies loaded</div>`;
+        } else {
+          for (const s of studyList) {
+            const mod = studyModalityLabel(s.description || '');
+            const modClass = mod.toLowerCase();
+            const dateStr = s.date ? formatStudyDate(s.date) : '—';
+            const imgCount = (s.images || []).length;
+            html += `<div class="report-study-row">
+              <span class="report-modality ${modClass}">${mod}</span>
+              <span class="report-study-desc">${escHtml(s.description || 'Unknown')}</span>
+              <span class="report-study-meta">${imgCount} img · ${escHtml(dateStr)}</span>
+            </div>`;
+          }
+        }
+      }
+      html += `</div>`;
+    }
+    document.getElementById('reportBody').innerHTML = html || '<div class="report-loading">No patients</div>';
+  }
+
+  function closeReport() {
+    document.getElementById('reportOverlay').style.display = 'none';
+  }
+
+  function copyReport() {
+    const body = document.getElementById('reportBody');
+    const title = document.getElementById('reportTitle').textContent;
+    // Build plain-text version
+    let lines = [title, ''];
+    body.querySelectorAll('.report-patient-block').forEach(block => {
+      lines.push(block.querySelector('.report-patient-name')?.textContent || '');
+      lines.push(block.querySelector('.report-patient-dob')?.textContent || '');
+      block.querySelectorAll('.report-study-row').forEach(row => {
+        const mod  = row.querySelector('.report-modality')?.textContent || '';
+        const desc = row.querySelector('.report-study-desc')?.textContent || '';
+        const meta = row.querySelector('.report-study-meta')?.textContent || '';
+        lines.push(`  [${mod}] ${desc}  ${meta}`);
+      });
+      const noStudies = block.querySelector('.report-no-studies');
+      if (noStudies) lines.push(`  ${noStudies.textContent}`);
+      lines.push('');
+    });
+    navigator.clipboard.writeText(lines.join('\n')).then(() => {
+      const btn = document.getElementById('reportCopyBtn');
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+    }).catch(() => {});
+  }
+
+  // ── Auto-refresh ──
+  loadPatients();
+  setInterval(loadPatients, 5000);
+</script>
+</body>
+</html>

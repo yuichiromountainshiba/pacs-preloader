@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# PACS cached data (images + patient index — device-local, not for repo)
+pacs_data/
+
+# OS
+.DS_Store
+Thumbs.db
