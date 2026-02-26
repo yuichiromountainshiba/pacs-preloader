@@ -247,7 +247,8 @@ def serve_image(patient_key: str, filename: str):
     filepath = IMAGES_DIR / patient_key / filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(filepath, media_type="image/jpeg")
+    return FileResponse(filepath, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.post("/api/patients/{patient_key}/request-refresh")
