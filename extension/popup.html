@@ -81,7 +81,6 @@
     #log .success { color: #34d399; }
     #log .info { color: #94a3b8; }
 
-    .ocr-section { border-top: 1px solid #1e293b; padding: 8px 10px 6px; margin-bottom: 14px; }
     .ocr-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
     .ocr-hint { font-size: 10px; color: #475569; }
     .ocr-drop {
@@ -99,6 +98,27 @@
     .ocr-btns button { flex: 1; padding: 5px; border-radius: 5px; font-size: 11px; cursor: pointer; border: none; }
     #ocrApplyBtn { background: #0ea5e9; color: white; font-weight: 600; }
     #ocrClearBtn { background: #1e293b; color: #64748b; }
+
+    .import-section { border-top: 1px solid #1e293b; padding: 8px 0 6px; margin-bottom: 14px; }
+    .import-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+    .import-tab { flex: 1; padding: 5px; border-radius: 5px; font-size: 11px; cursor: pointer;
+      background: #1e293b; color: #64748b; border: 1px solid #334155; }
+    .import-tab.active { background: #0ea5e9; color: white; border-color: #0ea5e9; }
+    .import-file-label { display: block; border: 1px dashed #334155; border-radius: 6px;
+      padding: 10px; text-align: center; font-size: 11px; color: #475569; cursor: pointer; }
+    .import-file-label:hover { border-color: #38bdf8; color: #94a3b8; }
+    .provider-dropdown-btn { width: 100%; background: #1e293b; border: 1px solid #334155;
+      border-radius: 6px; color: #e2e8f0; padding: 6px 10px; font-size: 12px;
+      text-align: left; cursor: pointer; }
+    .provider-dropdown { position: absolute; z-index: 20; width: 100%; background: #1e293b;
+      border: 1px solid #334155; border-radius: 6px; margin-top: 2px;
+      max-height: 150px; overflow-y: auto; padding: 4px 0; }
+    .provider-option { display: flex; align-items: center; gap: 6px;
+      padding: 5px 10px; font-size: 12px; color: #e2e8f0; cursor: pointer; }
+    .provider-option:hover { background: #334155; }
+    .provider-select-all { font-size: 10px; color: #475569; padding: 3px 10px;
+      display: flex; gap: 8px; border-bottom: 1px solid #1e293b; margin-bottom: 2px; }
+    .provider-select-all a { color: #38bdf8; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -127,26 +147,53 @@ Smith, John  01/15/1965
 Doe, Jane  03/22/1980"></textarea>
   <div class="hint">Format: "Last, First  MM/DD/YYYY" — one patient per line</div>
 
-  <!-- Schedule OCR -->
-  <div class="ocr-section" id="ocrSection">
-    <div class="ocr-header">
-      <span class="section-label">Schedule from Screenshot</span>
-      <span class="ocr-hint">Win+Shift+S → copy → paste below</span>
+  <!-- Schedule Import (PDF + OCR) -->
+  <div class="import-section" id="importSection">
+    <div class="import-tabs">
+      <button class="import-tab active" id="tabPdf">PDF Upload</button>
+      <button class="import-tab" id="tabOcr">Screenshot OCR</button>
     </div>
-    <div class="ocr-drop" id="ocrDrop" tabindex="0">
-      Click here, then Ctrl+V to paste screenshot
+
+    <!-- PDF panel -->
+    <div id="pdfPanel">
+      <label class="import-file-label">
+        <input type="file" id="pdfFile" accept=".pdf" style="display:none">
+        Click to select clinic schedule PDF
+      </label>
+      <div class="ocr-status" id="pdfStatus"></div>
+      <div id="providerFilterRow" style="display:none; margin-top:6px;">
+        <div style="position:relative">
+          <button class="provider-dropdown-btn" id="providerDropdownBtn">All providers ▾</button>
+          <div class="provider-dropdown" id="providerDropdown" style="display:none"></div>
+        </div>
+      </div>
+      <div class="ocr-btns" id="pdfBtns" style="display:none; margin-top:6px;">
+        <button id="pdfApplyBtn">↑ Apply to Schedule</button>
+        <button id="pdfClearBtn">Clear</button>
+      </div>
     </div>
-    <div class="ocr-preview" id="ocrPreview" style="display:none">
-      <img id="ocrImg" alt="pasted screenshot">
-      <div class="ocr-status" id="ocrStatus"></div>
-      <textarea id="ocrResult" class="ocr-result" placeholder="Extracted patients (edit as needed)…" spellcheck="false"></textarea>
-      <details id="ocrRawDetails" style="margin-top:2px">
-        <summary style="font-size:10px;color:#475569;cursor:pointer">Raw OCR text</summary>
-        <textarea id="ocrRaw" class="ocr-result" style="height:60px;margin-top:3px;color:#64748b" readonly></textarea>
-      </details>
-      <div class="ocr-btns">
-        <button id="ocrApplyBtn">↑ Apply to Schedule</button>
-        <button id="ocrClearBtn">Clear</button>
+
+    <!-- OCR panel (initially hidden) -->
+    <div id="ocrPanel" style="display:none">
+      <div class="ocr-header">
+        <span class="section-label">Schedule from Screenshot</span>
+        <span class="ocr-hint">Win+Shift+S → copy → paste below</span>
+      </div>
+      <div class="ocr-drop" id="ocrDrop" tabindex="0">
+        Click here, then Ctrl+V to paste screenshot
+      </div>
+      <div class="ocr-preview" id="ocrPreview" style="display:none">
+        <img id="ocrImg" alt="pasted screenshot">
+        <div class="ocr-status" id="ocrStatus"></div>
+        <textarea id="ocrResult" class="ocr-result" placeholder="Extracted patients (edit as needed)…" spellcheck="false"></textarea>
+        <details id="ocrRawDetails" style="margin-top:2px">
+          <summary style="font-size:10px;color:#475569;cursor:pointer">Raw OCR text</summary>
+          <textarea id="ocrRaw" class="ocr-result" style="height:60px;margin-top:3px;color:#64748b" readonly></textarea>
+        </details>
+        <div class="ocr-btns">
+          <button id="ocrApplyBtn">↑ Apply to Schedule</button>
+          <button id="ocrClearBtn">Clear</button>
+        </div>
       </div>
     </div>
   </div>

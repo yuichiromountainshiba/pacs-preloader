@@ -6,6 +6,10 @@ let pacsTabId = null;
 let isPreloading = false;
 let ocrDropActive = false;
 
+let parsedPdfPatients = [];
+let pdfProviders = [];
+const selectedProviders = new Set();
+
 const FILTER_KEYS = ['filterSpine', 'filterXR', 'filterCT', 'filterMR'];
 const STORAGE_KEYS = ['schedule', 'serverUrl', 'clinicDate', ...FILTER_KEYS];
 
@@ -68,6 +72,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   chrome.runtime.onMessage.addListener(handleBackgroundMessage);
 
   initOcr();
+  initPdf();
 });
 
 function handleBackgroundMessage(msg) {
@@ -307,4 +312,147 @@ function clearOcr() {
   document.getElementById('ocrRaw').value = '';
   document.getElementById('ocrStatus').textContent = '';
   document.getElementById('ocrImg').src = '';
+}
+
+
+// ── PDF Schedule Upload ──
+
+function switchImportTab(tab) {
+  document.getElementById('pdfPanel').style.display = tab === 'pdf' ? '' : 'none';
+  document.getElementById('ocrPanel').style.display = tab === 'ocr' ? '' : 'none';
+  document.getElementById('tabPdf').classList.toggle('active', tab === 'pdf');
+  document.getElementById('tabOcr').classList.toggle('active', tab === 'ocr');
+}
+
+function initPdf() {
+  document.getElementById('pdfFile').addEventListener('change', handlePdfUpload);
+  document.getElementById('pdfApplyBtn').addEventListener('click', applyPdfResult);
+  document.getElementById('pdfClearBtn').addEventListener('click', clearPdf);
+  document.getElementById('tabPdf').addEventListener('click', () => switchImportTab('pdf'));
+  document.getElementById('tabOcr').addEventListener('click', () => switchImportTab('ocr'));
+  document.getElementById('providerDropdownBtn').addEventListener('click', toggleProviderDropdown);
+
+  // Event delegation for provider dropdown (avoids inline handlers blocked by CSP)
+  const dd = document.getElementById('providerDropdown');
+  dd.addEventListener('click', e => {
+    const a = e.target.closest('[data-select-all]');
+    if (a) setAllProviders(a.dataset.selectAll === 'true');
+  });
+  dd.addEventListener('change', e => {
+    const cb = e.target.closest('input[type=checkbox]');
+    if (cb) toggleProvider(cb.value, cb.checked);
+  });
+
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#providerFilterRow'))
+      document.getElementById('providerDropdown').style.display = 'none';
+  });
+}
+
+async function handlePdfUpload(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const serverUrl = $('#serverUrl').value.replace(/\/$/, '');
+  const statusEl = document.getElementById('pdfStatus');
+  statusEl.textContent = 'Parsing PDF…';
+  document.getElementById('pdfBtns').style.display = 'none';
+  document.getElementById('providerFilterRow').style.display = 'none';
+
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const resp = await fetch(`${serverUrl}/api/parse-pdf`, { method: 'POST', body: form });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      statusEl.textContent = `Error: ${err.detail}`;
+      return;
+    }
+    const data = await resp.json();
+    parsedPdfPatients = data.patients;
+    pdfProviders = data.providers;
+    selectedProviders.clear();
+    pdfProviders.forEach(p => selectedProviders.add(p));
+
+    const n = data.count;
+    statusEl.textContent = `Found ${n} patient${n !== 1 ? 's' : ''} · ${pdfProviders.length} provider${pdfProviders.length !== 1 ? 's' : ''}`;
+    if (pdfProviders.length > 1) {
+      buildProviderDropdown();
+      document.getElementById('providerFilterRow').style.display = '';
+    }
+    document.getElementById('pdfBtns').style.display = 'flex';
+  } catch (err) {
+    statusEl.textContent = `Server error: ${err.message}`;
+  }
+}
+
+function buildProviderDropdown() {
+  const dd = document.getElementById('providerDropdown');
+  dd.innerHTML = `<div class="provider-select-all">
+    <a data-select-all="true">All</a> · <a data-select-all="false">None</a>
+  </div>` + pdfProviders.map(p =>
+    `<label class="provider-option">
+      <input type="checkbox" value="${escHtml(p)}" ${selectedProviders.has(p) ? 'checked' : ''}>
+      ${escHtml(p)}
+    </label>`
+  ).join('');
+  updateProviderBtn();
+}
+
+function toggleProviderDropdown() {
+  const dd = document.getElementById('providerDropdown');
+  dd.style.display = dd.style.display === 'none' ? '' : 'none';
+}
+
+function toggleProvider(name, checked) {
+  if (checked) selectedProviders.add(name); else selectedProviders.delete(name);
+  updateProviderBtn();
+}
+
+function setAllProviders(checked) {
+  pdfProviders.forEach(p => checked ? selectedProviders.add(p) : selectedProviders.delete(p));
+  document.querySelectorAll('#providerDropdown input[type=checkbox]')
+    .forEach(cb => { cb.checked = checked; });
+  updateProviderBtn();
+}
+
+function updateProviderBtn() {
+  const n = selectedProviders.size, total = pdfProviders.length;
+  document.getElementById('providerDropdownBtn').textContent =
+    n === total ? `All providers (${total}) ▾` :
+    n === 0    ? 'No providers selected ▾' :
+                 `${n} of ${total} providers ▾`;
+}
+
+function applyPdfResult() {
+  const filtered = parsedPdfPatients
+    .filter(p => !p.provider || selectedProviders.has(p.provider))
+    .map(p => `${p.name}  ${p.dob}`);
+  if (!filtered.length) return;
+  const current = $('#schedule').value.trim();
+  $('#schedule').value = current ? `${current}\n${filtered.join('\n')}` : filtered.join('\n');
+  chrome.storage.local.set({ schedule: $('#schedule').value });
+  // Auto-fill clinic date if all patients share one date
+  const dates = [...new Set(parsedPdfPatients.map(p => p.clinic_date).filter(Boolean))];
+  if (dates.length === 1 && !$('#clinicDate').value) {
+    const iso = toInputDate(dates[0]);
+    if (iso) { $('#clinicDate').value = iso; chrome.storage.local.set({ clinicDate: iso }); }
+  }
+  document.getElementById('providerDropdown').style.display = 'none';
+}
+
+function clearPdf() {
+  parsedPdfPatients = []; pdfProviders = []; selectedProviders.clear();
+  document.getElementById('pdfStatus').textContent = '';
+  document.getElementById('pdfBtns').style.display = 'none';
+  document.getElementById('providerFilterRow').style.display = 'none';
+  document.getElementById('pdfFile').value = '';
+}
+
+function toInputDate(str) {
+  const m = str.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  return m ? `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}` : '';
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }

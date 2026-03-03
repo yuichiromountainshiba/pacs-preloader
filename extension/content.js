@@ -551,6 +551,23 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
 
   const seriesResults = await pLimit(viewTasks, 3);
 
+  // ── Step 1b: Fetch DICOM slice metadata in parallel for MRI/CT series ──
+  const isMriOrCt = /^(MR|MRI|CT)[\s\-]/i.test(studyDescription);
+  const metadataMap = {};  // imageUrl → { sliceLocation, imagePosition }
+  if (isMriOrCt) {
+    const allMetaFetches = [];
+    for (const sr of seriesResults) {
+      if (!sr || !sr.urls.length) continue;
+      for (const url of sr.urls) {
+        allMetaFetches.push(fetchSliceMetadata(url).then(m => [url, m]));
+      }
+    }
+    const metaResults = await Promise.all(allMetaFetches);
+    for (const [url, meta] of metaResults) {
+      if (meta) metadataMap[url] = meta;
+    }
+  }
+
   // ── Step 2: Collect all image download tasks ──
   const downloadTasks = [];
   for (const sr of seriesResults) {
@@ -579,7 +596,26 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
           fd.append('study_date',        sDate);
           fd.append('image_index',       String(i));
           fd.append('clinic_date',       clinicDate || '');
-           fd.append('image_uid',         imageUid);
+          fd.append('image_uid',         imageUid);
+
+          const meta = metadataMap[url];
+          if (meta?.sliceLocation != null && isFinite(meta.sliceLocation)) {
+            fd.append('slice_location', String(meta.sliceLocation));
+          }
+          if (meta?.imagePosition?.length === 3 && meta.imagePosition.every(isFinite)) {
+            fd.append('image_position', JSON.stringify(meta.imagePosition));
+          }
+          // Upload even if some IOP components are NaN (InteleBrowser truncates near-zero values
+          // to '...' — but iop[0] for AX and iop[5] for SAG are always ±1, never truncated).
+          // JSON.stringify converts NaN → null; viewer handles null gracefully.
+          if (meta?.imageOrientation?.length === 6) {
+            fd.append('image_orientation', JSON.stringify(meta.imageOrientation));
+          }
+          if (meta?.rows != null) fd.append('rows', String(meta.rows));
+          if (meta?.cols != null) fd.append('cols', String(meta.cols));
+          if (meta?.pixelSpacing?.length === 2 && meta.pixelSpacing.every(isFinite)) {
+            fd.append('pixel_spacing', JSON.stringify(meta.pixelSpacing));
+          }
 
           const resp = await fetch(`${serverUrl}/api/images`, { method: 'POST', body: fd });
           return resp.ok ? 1 : 0;
@@ -707,6 +743,84 @@ function getImageUidFromUrl(url) {
     return u.pathname + '?' + u.searchParams.toString();
   } catch {
     return String(url || '');
+  }
+}
+
+async function fetchSliceMetadata(imageUrl) {
+  try {
+    const u = new URL(imageUrl, window.location.origin);
+    u.searchParams.set('action', 'singleimage');
+    const r = await fetch(u.toString(), { credentials: 'include' });
+    if (!r.ok) {
+      console.warn('[PACS-DOM] singleimage HTTP', r.status, u.toString().slice(-60));
+      return null;
+    }
+    const html = await r.text();
+
+    // Parse ImagePositionPatient (0020,0032): [X\Y\Z] of top-left pixel
+    const ippM = html.match(/\(0020,0032\)[^\[]*\[([^\]]+)\]/);
+    if (!ippM) return null;
+    const imagePosition = ippM[1].trim().split('\\').map(v => parseFloat(v.trim()));
+    if (imagePosition.length < 3 || !imagePosition.every(isFinite)) return null;
+
+    // Parse ImageOrientationPatient (0020,0037): [rowX\rowY\rowZ\colX\colY\colZ]
+    const iopM = html.match(/\(0020,0037\)[^\[]*\[([^\]]+)\]/);
+    let sliceLocation = null;
+    let imageOrientation = null;
+
+    if (iopM) {
+      // Parse IOP with truncation correction.
+      // InteleBrowser truncates long decimals with '...' — e.g. a near-unit value like
+      // '-0.9998...' is displayed as '-0.9...' and parseFloat gives -0.9.
+      // A dominant direction cosine (|val| ≥ 0.85) with '...' present is almost certainly
+      // a truncated ±1 — snap it to avoid ~10% geometry errors in physicalExtent.
+      const iop = iopM[1].trim().split('\\').map(vRaw => {
+        const v = vRaw.trim();
+        const val = parseFloat(v);
+        if (!isFinite(val)) return NaN;
+        if (v.includes('...') && Math.abs(val) >= 0.85) return val < 0 ? -1 : 1;
+        return val;
+      });
+      if (iop.length >= 6) {
+        imageOrientation = iop.slice(0, 6);
+        if (iop.every(isFinite)) {
+          const [rx, ry, rz, cx, cy, cz] = iop;
+          const nx = ry*cz - rz*cy;
+          const ny = rz*cx - rx*cz;
+          const nz = rx*cy - ry*cx;
+          sliceLocation = imagePosition[0]*nx + imagePosition[1]*ny + imagePosition[2]*nz;
+        }
+      }
+    }
+
+    // Fallback: use stored (0020,1041) SliceLocation if IOP unavailable
+    if (sliceLocation == null) {
+      const slM = html.match(/\(0020,1041\)[^\[]*\[([^\]]+)\]/);
+      if (slM) sliceLocation = parseFloat(slM[1].trim());
+    }
+
+    // Image dimensions and pixel spacing for physical extent computation
+    const rowsM = html.match(/\(0028,0010\)[^\[]*\[(\d+)\]/);
+    const colsM = html.match(/\(0028,0011\)[^\[]*\[(\d+)\]/);
+    const psM   = html.match(/\(0028,0030\)[^\[]*\[([^\]]+)\]/);
+    const rows = rowsM ? parseInt(rowsM[1]) : null;
+    const cols = colsM ? parseInt(colsM[1]) : null;
+    const pixelSpacing = psM
+      ? psM[1].trim().split('\\').map(v => parseFloat(v.trim())).slice(0, 2)
+      : null;
+
+    if (!fetchSliceMetadata._logged) {
+      fetchSliceMetadata._logged = true;
+      console.log('[PACS-DOM] singleimage OK — IPP:', imagePosition, 'SL:', sliceLocation,
+                  'rows:', rows, 'cols:', cols, 'ps:', pixelSpacing);
+    }
+
+    // Return data even without sliceLocation — imagePosition/imageOrientation are
+    // sufficient for the viewer's physical extent computation.
+    return { sliceLocation, imagePosition, imageOrientation, rows, cols, pixelSpacing };
+  } catch (e) {
+    console.warn('[PACS-DOM] fetchSliceMetadata error:', e.message);
+    return null;
   }
 }
 

@@ -297,10 +297,31 @@
     .patient-refresh-btn:hover { color: #64748b; }
     .patient-item.refresh-pending .patient-name::after { content: ' ↻'; display: inline-block; animation: spin 1s linear infinite; }
     @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .refresh-pending-age { color: #f59e0b; font-size: 10px; }
+
+    /* Toast notifications */
+    .toast {
+      position: fixed; bottom: 24px; right: 20px; z-index: 9999;
+      padding: 10px 16px; border-radius: 8px; font-size: 13px; font-weight: 500;
+      max-width: 320px; box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+      opacity: 1; transition: opacity 0.5s;
+    }
+    .toast-success { background: #059669; color: #fff; }
+    .toast-error   { background: #dc2626; color: #fff; }
+    .toast-info    { background: #1e40af; color: #fff; }
+    .toast-fade    { opacity: 0; }
 
     /* Snapshot button style */
     .snapshot-btn { }
     .snapshot-btn.active { background: #059669; border-color: #059669; }
+
+    /* Cast bar */
+    .cast-bar { display: flex; justify-content: center; align-items: center; gap: 6px; padding: 0 12px 4px; flex-wrap: wrap; }
+    .cast-bar-label { font-size: 11px; color: rgba(255,255,255,0.35); font-weight: 500; margin-right: 2px; }
+    .cast-btn.active { background: #d97706; border-color: #d97706; color: white; }
+    .cast-open-link { color: rgba(255,255,255,0.35); font-size: 11px; text-decoration: none;
+      margin-left: 2px; margin-right: 4px; line-height: 1; }
+    .cast-open-link:hover { color: rgba(255,255,255,0.7); }
 
     /* ── Date report button ── */
     .date-report-btn {
@@ -365,6 +386,63 @@
     .report-study-meta { font-size: 11px; color: #475569; white-space: nowrap; }
     .report-no-studies { font-size: 12px; color: #334155; font-style: italic; padding: 2px 0 4px; }
     .report-loading { font-size: 13px; color: #475569; padding: 32px 0; text-align: center; }
+
+    /* ── Reference lines ── */
+    .ref-line-overlay {
+      position: absolute; inset: 0;
+      pointer-events: none; z-index: 2;
+    }
+    .ref-line-h, .ref-line-v { position: absolute; display: none; }
+    .ref-line-h {
+      left: 0; right: 0; height: 1.5px;
+      background: rgba(255, 165, 0, 0.85);
+    }
+    .ref-line-v {
+      top: 0; bottom: 0; width: 1.5px;
+      background: rgba(255, 165, 0, 0.85);
+    }
+    .ref-line-svg {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      pointer-events: none; overflow: visible;
+    }
+
+    /* ── Series swap dropdown ── */
+    .mri-series-label { position: relative; }
+    .mri-swap-arrow { opacity: 0.7; font-size: 0.75em; margin-left: 2px; }
+    .mri-series-label.has-swap { cursor: pointer; }
+    .mri-series-label.has-swap:hover .mri-series-label-text { text-decoration: underline; }
+    .series-swap-menu {
+      position: absolute; top: 100%; left: 0; z-index: 50;
+      background: #1a1a2e; border: 1px solid #444;
+      border-radius: 4px; padding: 4px 0;
+      list-style: none; margin: 0; min-width: 140px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+    }
+    .series-swap-menu li {
+      padding: 6px 12px; font-size: 0.78rem; cursor: pointer; color: #ddd;
+    }
+    .series-swap-menu li:hover { background: rgba(255,255,255,0.1); }
+
+    /* ── Brightness / Contrast ── */
+    #mainImage, .mri-stack-img, .row-img, .compare-img, #fsImage {
+      filter: brightness(var(--img-brightness,1)) contrast(var(--img-contrast,1));
+    }
+    .bc-bar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 2px 14px 6px; flex-wrap: nowrap;
+    }
+    .bc-label { font-size: 10px; color: #64748b; white-space: nowrap; }
+    .bc-bar input[type=range] {
+      flex: 1; accent-color: #38bdf8; min-width: 60px; max-width: 120px;
+    }
+    .bc-reset {
+      background: none; border: none; color: #64748b; cursor: pointer;
+      font-size: 14px; padding: 2px 6px; border-radius: 4px; line-height: 1;
+      transition: color 0.15s; -webkit-tap-highlight-color: transparent;
+    }
+    .bc-reset:hover { color: #94a3b8; }
+    /* Sagittal columns: crosshair cursor to hint jump-to-disc */
+    .mri-series-column.sag-jumpable .mri-stack-img { cursor: crosshair; }
   </style>
 </head>
 <body>
@@ -400,6 +478,12 @@
         </div>
       </div>
       <div class="study-bar" id="studyBar" style="display:none;"></div>
+      <div class="cast-bar" id="castBar" style="display:none;">
+        <span class="cast-bar-label">Cast to:</span>
+        <button class="filter-btn cast-btn" id="castRoom1" onclick="setCastRoom('room1')" ondblclick="renameCastRoom(event,'room1')">Room 1</button><a class="cast-open-link" href="/cast/room1" target="_blank" title="Open cast display">↗</a>
+        <button class="filter-btn cast-btn" id="castRoom2" onclick="setCastRoom('room2')" ondblclick="renameCastRoom(event,'room2')">Room 2</button><a class="cast-open-link" href="/cast/room2" target="_blank" title="Open cast display">↗</a>
+        <button class="filter-btn cast-btn" id="castRoom3" onclick="setCastRoom('room3')" ondblclick="renameCastRoom(event,'room3')">Room 3</button><a class="cast-open-link" href="/cast/room3" target="_blank" title="Open cast display">↗</a>
+      </div>
       <div class="filter-bar" id="filterBar" style="display:none;">
         <button class="filter-btn active" data-region="all"      onclick="setRegionFilter('all')">All</button>
         <button class="filter-btn"        data-region="lumbar"   onclick="setRegionFilter('lumbar')">Lumbar</button>
@@ -407,6 +491,14 @@
         <button class="filter-btn"        data-region="thoracic" onclick="setRegionFilter('thoracic')">Thoracic</button>
         <button class="filter-btn compare-btn" id="compareBtn" onclick="toggleCompareMode()">Compare</button>
         <button class="filter-btn snapshot-btn" id="snapshotBtn" onclick="toggleSnapshotMode()">Snapshot</button>
+        <button class="filter-btn" id="bcBtn" onclick="toggleBC()" title="Brightness / Contrast">☀</button>
+      </div>
+      <div class="bc-bar" id="bcBar" style="display:none;">
+        <span class="bc-label">Brightness</span>
+        <input type="range" id="brightnessSlider" min="50" max="200" value="100" step="5">
+        <span class="bc-label">Contrast</span>
+        <input type="range" id="contrastSlider" min="50" max="200" value="100" step="5">
+        <button class="bc-reset" onclick="resetBC()" title="Reset">↺</button>
       </div>
       <!-- Compare mode: top/bottom chip rows (shown only in compare mode) -->
       <div id="compareChipSection" style="display:none;">
@@ -491,6 +583,16 @@
 <script>
   const API = window.location.origin;
 
+  // Display mode: viewer loaded inside a cast room iframe
+  const _urlParams   = new URLSearchParams(window.location.search);
+  const _castPatient = _urlParams.get('patient');
+  const _displayMode = _urlParams.has('displaymode');
+  if (_displayMode) {
+    // Hide sidebar and cast controls — this is a read-only room display
+    document.getElementById('sidebar').classList.add('collapsed');
+    document.getElementById('castBar') && (document.getElementById('castBar').style.display = 'none');
+  }
+
   // State
   let allImages     = [];   // all images for current patient
   let allStudies    = [];   // [{description, date}]
@@ -504,8 +606,8 @@
   // Snapshot mode state
   let snapshotPatientKey = null;
 
-  // Per-patient refresh tracking
-  const pendingRefreshKeys = new Set();
+  // Per-patient refresh tracking: key → timestamp (ms) when refresh was requested
+  const pendingRefreshKeys = new Map();
 
   // Date group collapse state (persists across renderPatientList re-renders)
   const collapsedDates = new Set();
@@ -517,9 +619,17 @@
   let fsImages = [];
   let fsIndex  = 0;
 
-  // Region keywords — allow generic 'spine' for lumbar so labels like "L-SPINEAP" still match
+  // Cast state
+  let castActiveRoom    = null;
+  let castDebounceTimer = null;
+  let lastVisibleUrl    = null;   // last image shown in any view mode
+
+  // Reference line link groups: groupId → [{ colEl, isSag, isAx, setReferenceLine, triggerUpdate }]
+  const mriLinkGroups = {};
+
+  // Region keywords
   const REGION_KW = {
-    lumbar:   ['lumbar', 'lumbosacral', 'l-spine', 'l spine', 'spine', 'l1', 'l2', 'l3', 'l4', 'l5', 's1', 'sacrum', 'sacral', 'coccyx', 'scoliosis'],
+    lumbar:   ['lumbar', 'lumbosacral', 'l-spine', 'l spine', 'l1', 'l2', 'l3', 'l4', 'l5', 's1', 'sacrum', 'sacral', 'coccyx', 'scoliosis'],
     cervical: ['cervical', 'c-spine', 'c spine', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'myelogram'],
     thoracic: ['thoracic', 't-spine', 't spine', 't1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10', 't11', 't12'],
   };
@@ -550,6 +660,7 @@
   }, { passive: true });
 
   document.addEventListener('keydown', e => {
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
     if (document.getElementById('fullscreenOverlay').classList.contains('open')) {
       if (e.key === 'ArrowLeft') fsNav(-1);
       if (e.key === 'ArrowRight') fsNav(1);
@@ -557,6 +668,8 @@
     } else {
       if (e.key === 'ArrowLeft') prevImage();
       if (e.key === 'ArrowRight') nextImage();
+      if ((e.key === 'c' || e.key === 'C') && allImages.length) toggleCompareMode();
+      if ((e.key === 's' || e.key === 'S') && snapshotPatientKey) toggleSnapshotMode();
     }
   });
 
@@ -570,7 +683,10 @@
         if (pendingRefreshKeys.has(p.key)) {
           const prevEl = document.querySelector(`[data-key="${CSS.escape(p.key)}"] .patient-badge`);
           const prevCount = prevEl ? parseInt(prevEl.textContent) : -1;
-          if (p.image_count > prevCount) pendingRefreshKeys.delete(p.key);
+          if (p.image_count > prevCount) {
+            pendingRefreshKeys.delete(p.key);
+            showToast(`✓ ${p.name} refreshed — ${p.image_count} image${p.image_count !== 1 ? 's' : ''} now`, 'success');
+          }
         }
       }
       renderPatientList(data.patients);
@@ -579,9 +695,10 @@
 
   function renderPatientList(patients) {
     const list = document.getElementById('patientList');
-    const empty = document.getElementById('emptyState');
-    if (!patients.length) { empty.style.display = 'block'; return; }
-    empty.style.display = 'none';
+    if (!patients.length) {
+      list.innerHTML = '<div class="empty-state"><p>No preloaded images yet.<br>Use the Chrome extension to preload.</p></div>';
+      return;
+    }
 
     // Group by clinic date, most recent first
     const groups = {};
@@ -618,11 +735,12 @@
         <div class="date-header" onclick="toggleDateGroup('${escAttr(dk)}')">${arrowSvg}<span>${escHtml(label)}</span><span class="date-patient-count">${countStr}</span><button class="date-report-btn" title="Imaging report" onclick="event.stopPropagation(); openDateReport('${escAttr(dk)}')">${reportSvg}</button></div>`;
       for (const p of pts) {
         const isPending = pendingRefreshKeys.has(p.key);
+        const pendingAge = isPending ? formatRefreshAge(pendingRefreshKeys.get(p.key)) : '';
         html += `<div class="patient-item${isPending ? ' refresh-pending' : ''}" data-key="${escAttr(p.key)}" onclick="selectPatient('${escAttr(p.key)}')">
           <div class="patient-item-inner">
             <div class="patient-item-content">
               <div class="patient-name">${escHtml(p.name)}</div>
-              <div class="patient-meta">DOB: ${escHtml(p.dob)}</div>
+              <div class="patient-meta">DOB: ${escHtml(p.dob)}${pendingAge ? ` · <span class="refresh-pending-age">↻ ${escHtml(pendingAge)}</span>` : ''}</div>
               <span class="patient-badge">${p.image_count} image${p.image_count !== 1 ? 's' : ''} · ${p.study_count} study</span>
             </div>
             <button class="patient-refresh-btn" title="Request refresh" onclick="event.stopPropagation(); requestPatientRefresh('${escAttr(p.key)}')">${refreshSvg}</button>
@@ -646,12 +764,40 @@
   }
 
   async function requestPatientRefresh(key) {
-    pendingRefreshKeys.add(key);
+    pendingRefreshKeys.set(key, Date.now());
     const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
     if (el) el.classList.add('refresh-pending');
     try {
-      await fetch(`${API}/api/patients/${encodeURIComponent(key)}/request-refresh`, { method: 'POST' });
-    } catch (e) { console.error('requestPatientRefresh:', e); }
+      const resp = await fetch(`${API}/api/patients/${encodeURIComponent(key)}/request-refresh`, { method: 'POST' });
+      if (resp.ok) {
+        showToast('Refresh queued — extension will fetch when idle', 'info');
+      } else {
+        showToast(`Refresh failed: server returned ${resp.status}`, 'error');
+        pendingRefreshKeys.delete(key);
+        if (el) el.classList.remove('refresh-pending');
+      }
+    } catch (e) {
+      showToast('Server unreachable — is it running?', 'error');
+      pendingRefreshKeys.delete(key);
+      if (el) el.classList.remove('refresh-pending');
+    }
+  }
+
+  function showToast(msg, type = 'info') {
+    const el = document.createElement('div');
+    el.className = `toast toast-${type}`;
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.classList.add('toast-fade'), 3500);
+    setTimeout(() => el.remove(), 4100);
+  }
+
+  function formatRefreshAge(ms) {
+    const sec = Math.round((Date.now() - ms) / 1000);
+    if (sec < 10)  return 'pending just now';
+    if (sec < 60)  return `pending ${sec}s ago`;
+    const min = Math.round(sec / 60);
+    return `pending ${min}m ago`;
   }
 
   // ── Select Patient ──
@@ -702,6 +848,12 @@
               entry.sliceIndex = parsed.sliceIndex;
             }
           }
+          entry.sliceLocation    = img.slice_location    ?? null;
+          entry.imagePosition    = img.image_position    ?? null;
+          entry.imageOrientation = img.image_orientation ?? null;
+          entry.rows             = img.rows              ?? null;
+          entry.cols             = img.cols              ?? null;
+          entry.pixelSpacing     = img.pixel_spacing     ?? null;
           allImages.push(entry);
         }
       }
@@ -710,6 +862,7 @@
       document.getElementById('welcome').style.display   = 'none';
       document.getElementById('mainImage').style.display = 'block';
       document.getElementById('studyBar').style.display  = 'flex';
+      document.getElementById('castBar').style.display   = 'flex';
       document.getElementById('filterBar').style.display = 'flex';
       snapshotPatientKey = key;
       if (viewMode === 'compare') {
@@ -833,6 +986,8 @@
       s.orderRank = getCtSeriesOrder(s.seriesLabel);
       s.middleIndex = Math.floor(s.images.length / 2);
       s.scrollToIndex = s.middleIndex;
+      const locs = s.images.map(i => i.sliceLocation).filter(v => v != null && isFinite(v));
+      s.sliceRange = locs.length >= 2 ? [Math.min(...locs), Math.max(...locs)] : null;
       return s;
     });
     seriesList.sort((a, b) => a.orderRank - b.orderRank || a.seriesLabel.localeCompare(b.seriesLabel));
@@ -853,6 +1008,8 @@
       s.middleIndex = Math.floor(s.images.length / 2);
       const isSagittal = /\bsag\b/i.test(s.seriesLabel || '');
       s.scrollToIndex = isSagittal ? s.middleIndex : 0;
+      const locs = s.images.map(i => i.sliceLocation).filter(v => v != null && isFinite(v));
+      s.sliceRange = locs.length >= 2 ? [Math.min(...locs), Math.max(...locs)] : null;
       return s;
     });
     seriesList.sort((a, b) => a.orderRank - b.orderRank || a.seriesLabel.localeCompare(b.seriesLabel));
@@ -873,6 +1030,7 @@
       btn.classList.remove('active');
       return;
     }
+    if (viewMode === 'snapshot') exitSnapshotMode();
     const ordered = getFilteredStudyKeysByDate();
     if (ordered.length === 0) return;
     viewMode = 'compare';
@@ -926,6 +1084,29 @@
     showSingleView();
   }
 
+  // Pick up to 3 series for the snapshot MRI half.
+  // Slot 1: Sag T2  Slot 2: Ax T2 Stack (preferred) or any Ax T2
+  // Slot 3: Ax T2 Multi (when Stack fills slot 2) OR Sag STIR otherwise
+  function pickSnapshotSeries(seriesList) {
+    const sagT2    = seriesList.find(s => s.orderRank === 0);
+    const allAxT2  = seriesList.filter(s => s.orderRank === 1);
+    const sagStir  = seriesList.find(s => s.orderRank === 2);
+    const axStack  = allAxT2.find(s => /stack/i.test(s.seriesLabel));
+    const axMulti  = allAxT2.find(s => /multi/i.test(s.seriesLabel));
+
+    const result = [];
+    if (sagT2) result.push(sagT2);
+    if (axStack && axMulti) {
+      result.push(axStack);
+      result.push(axMulti);
+    } else {
+      const axPrimary = axStack || axMulti || allAxT2[0] || null;
+      if (axPrimary) result.push(axPrimary);
+      if (sagStir) result.push(sagStir);
+    }
+    return result.slice(0, 3);
+  }
+
   function renderSnapshotView() {
     const sv = document.getElementById('snapshotView');
 
@@ -935,6 +1116,12 @@
       studyMatchesRegion(s.description, activeRegion)
     ).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
     const xrStudy = xrStudies[0] || null;
+
+    // Push first XR image to cast room if one is active
+    if (xrStudy) {
+      const xrFirst = allImages.find(img => img.studyKey === xrStudy.key);
+      if (xrFirst) pushCastImage(xrFirst.url, true);
+    }
 
     // Find most recent MRI study matching activeRegion
     const mriStudies = allStudies.filter(s =>
@@ -958,11 +1145,11 @@
       xrHtml = `<div class="snapshot-xr-half"><div class="snapshot-placeholder">No X-ray study found for this region</div></div>`;
     }
 
-    // Build MRI half — prefer ranks 0 (Sag T2), 1 (Ax T2), 2 (Sag STIR)
+    // Build MRI half — Sag T2 | Ax T2 Stack | Ax T2 Multi (or Sag STIR)
     let mriHtml = '';
     if (mriStudy) {
       const seriesList = getMriSeriesForStudy(mriStudy.key);
-      const wanted = seriesList.filter(s => s.orderRank <= 2).slice(0, 3);
+      const wanted = pickSnapshotSeries(seriesList);
       if (wanted.length > 0) {
         mriHtml = `<div class="snapshot-mri-half" id="snapshotMriHalf">${
           wanted.map(ser => {
@@ -997,10 +1184,12 @@
     // Wire up MRI columns
     if (mriStudy) {
       const seriesList = getMriSeriesForStudy(mriStudy.key);
-      const wanted = seriesList.filter(s => s.orderRank <= 2).slice(0, 3);
+      const wanted = pickSnapshotSeries(seriesList);
+      mriLinkGroups['snapshotView'] = [];
       sv.querySelectorAll('.snapshot-mri-half .mri-series-column').forEach((colEl, i) => {
-        if (wanted[i]) setupMriColumn(colEl, wanted[i].images, wanted[i].middleIndex);
+        if (wanted[i]) setupMriColumn(colEl, wanted[i].images, wanted[i].scrollToIndex ?? wanted[i].middleIndex, seriesList, 'snapshotView');
       });
+      triggerInitialReferenceLines('snapshotView');
     }
   }
 
@@ -1068,9 +1257,11 @@
           </div>`;
         }).join('');
         window[arrayName] = seriesList.map(s => s.images);
+        mriLinkGroups[el.id] = [];
         el.querySelectorAll('.mri-series-column').forEach((colEl, si) => {
-          setupMriColumn(colEl, seriesList[si].images, seriesList[si].middleIndex);
+          setupMriColumn(colEl, seriesList[si].images, seriesList[si].scrollToIndex ?? seriesList[si].middleIndex, seriesList, el.id);
         });
+        triggerInitialReferenceLines(el.id);
       } else {
         el.classList.remove('mri-half');
         el.innerHTML = imgs.map((img, i) =>
@@ -1086,6 +1277,7 @@
 
   // ── Row View (chip clicked) ──
   function openStudyRow(studyKey) {
+    if (viewMode === 'snapshot') exitSnapshotMode();
     viewMode = 'row';
     highlightStudyBtn(studyKey);
 
@@ -1172,45 +1364,377 @@
         </div>
       </div>`;
     }).join('');
+    mriLinkGroups['mriGrid'] = [];
     grid.querySelectorAll('.mri-series-column').forEach((colEl, i) => {
-      setupMriColumn(colEl, page[i].images, page[i].middleIndex);
+      setupMriColumn(colEl, page[i].images, page[i].scrollToIndex ?? page[i].middleIndex, window.mriActiveSeries, 'mriGrid');
     });
+    triggerInitialReferenceLines('mriGrid');
     const prevBtn = document.getElementById('mriNavPrev');
     const nextBtn = document.getElementById('mriNavNext');
     if (prevBtn) prevBtn.disabled = window.mriPage === 0;
     if (nextBtn) nextBtn.disabled = start + MRI_PAGE_SIZE >= series.length;
   }
 
-  function setupMriColumn(colEl, images, initialIndex) {
-    const imgEl = colEl.querySelector('.mri-stack-img');
+  function triggerInitialReferenceLines(groupId) {
+    const group = mriLinkGroups[groupId];
+    if (!group || group.length === 0) return;
+    group.forEach(reg => reg.triggerUpdate && reg.triggerUpdate());
+  }
+
+  function swapSeriesInColumn(colEl, newSeries, seriesList, linkGroupId) {
+    const mid = newSeries.scrollToIndex ?? newSeries.middleIndex;
+    colEl.innerHTML = `<div class="mri-series-label">
+        <span class="mri-series-label-text">${escHtml(newSeries.seriesLabel)}</span>
+        <span class="mri-slice-counter">${mid + 1}/${newSeries.images.length}</span>
+      </div>
+      <div class="mri-stack-frame">
+        <img class="mri-stack-img" src="${escHtml(newSeries.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+      </div>`;
+    // Remove old registration (setupMriColumn will also do this via _mriCleanup, belt+suspenders)
+    if (linkGroupId && mriLinkGroups[linkGroupId]) {
+      mriLinkGroups[linkGroupId] = mriLinkGroups[linkGroupId].filter(r => r.colEl !== colEl);
+    }
+    setupMriColumn(colEl, newSeries.images, mid, seriesList, linkGroupId);
+    triggerInitialReferenceLines(linkGroupId);
+  }
+
+  // ── Reference line geometry helpers ──
+
+  function dot3(a, b) {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+  }
+
+  function cross3(a, b) {
+    return [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]];
+  }
+
+  // Given the current axial slice (axIpp, axIop) and the sagittal column's physicalExtent,
+  // return { x1,y1, x2,y2 } in 0-1 proportional image coordinates for where the axial
+  // plane intersects the sagittal image, or null if outside the visible area.
+  function computeObliqueRefLine(axIpp, axIop, sagExtent) {
+    const { iop: sagIop, ipp: sagIpp, rows: sagRows, cols: sagCols, ps: sagPs } = sagExtent;
+    if (!sagIop || !sagIpp || !sagRows || !sagCols || !sagPs) return null;
+
+    // Normal to the axial slice plane
+    const n = cross3([axIop[0], axIop[1], axIop[2]], [axIop[3], axIop[4], axIop[5]]);
+    const len = Math.sqrt(dot3(n, n));
+    if (len < 1e-9) return null;
+    n[0] /= len; n[1] /= len; n[2] /= len;
+
+    // Line in sagittal pixel space: Ap*u_p + Bp*v_p + Cp = 0
+    // where u_p = col/( cols-1 ), v_p = row/( rows-1 ), both in [0,1]
+    const Ap = (sagCols - 1) * sagPs[1] * dot3(n, [sagIop[0], sagIop[1], sagIop[2]]);
+    const Bp = (sagRows - 1) * sagPs[0] * dot3(n, [sagIop[3], sagIop[4], sagIop[5]]);
+    const Cp = dot3(n, sagIpp) - dot3(n, axIpp);
+
+    // Find intersections with all four image edges
+    const EPS = 1e-9, TOL = 1e-4;
+    const pts = [];
+    function tryPt(u, v) {
+      if (u >= -TOL && u <= 1+TOL && v >= -TOL && v <= 1+TOL) {
+        const uc = Math.max(0, Math.min(1, u)), vc = Math.max(0, Math.min(1, v));
+        if (!pts.some(p => Math.abs(p[0]-uc) + Math.abs(p[1]-vc) < 1e-6)) pts.push([uc, vc]);
+      }
+    }
+    if (Math.abs(Bp) > EPS) { tryPt(0, -Cp/Bp); tryPt(1, -(Ap+Cp)/Bp); }
+    if (Math.abs(Ap) > EPS) { tryPt(-Cp/Ap, 0); tryPt(-(Bp+Cp)/Ap, 1); }
+
+    if (pts.length < 2) return null;
+    return { x1: pts[0][0], y1: pts[0][1], x2: pts[1][0], y2: pts[1][1] };
+  }
+
+  function setupMriColumn(colEl, images, initialIndex, seriesList = null, linkGroupId = null) {
+    // Clean up any previous setup on this element
+    if (colEl._mriCleanup) colEl._mriCleanup();
+
+    const imgEl     = colEl.querySelector('.mri-stack-img');
     const counterEl = colEl.querySelector('.mri-slice-counter');
-    let currentIdx = Math.max(0, Math.min(initialIndex, images.length - 1));
+    const labelEl   = colEl.querySelector('.mri-series-label');
+    const labelTextEl = colEl.querySelector('.mri-series-label-text');
+    const frameEl   = colEl.querySelector('.mri-stack-frame');
+    let currentIdx  = Math.max(0, Math.min(initialIndex, images.length - 1));
+
+    // Inject reference line overlay if not already present
+    let overlayEl = frameEl ? frameEl.querySelector('.ref-line-overlay') : null;
+    if (frameEl && !overlayEl) {
+      overlayEl = document.createElement('div');
+      overlayEl.className = 'ref-line-overlay';
+      overlayEl.innerHTML = '<div class="ref-line-h"></div><div class="ref-line-v"></div>' +
+        '<svg class="ref-line-svg" xmlns="http://www.w3.org/2000/svg">' +
+        '<line class="ref-line-d" stroke="rgba(255,165,0,0.85)" stroke-width="1.5" ' +
+        'vector-effect="non-scaling-stroke" display="none"/></svg>';
+      frameEl.appendChild(overlayEl);
+    }
+    const refLineH = overlayEl ? overlayEl.querySelector('.ref-line-h') : null;
+    const refLineV = overlayEl ? overlayEl.querySelector('.ref-line-v') : null;
+    const refLineD = overlayEl ? overlayEl.querySelector('.ref-line-d') : null;
+
+    // Resize the overlay to exactly match the rendered image content area.
+    // This bypasses any uncertainty about object-fit:contain black-bar offsets:
+    // once the overlay covers only the image pixels, top:X% / left:X% map directly
+    // to row/column proportions with no correction needed.
+    function updateOverlay() {
+      if (!overlayEl || !imgEl || !frameEl) return;
+      const fRect = frameEl.getBoundingClientRect();
+      const iRect = imgEl.getBoundingClientRect();
+      const iElW  = iRect.width  || 1;
+      const iElH  = iRect.height || 1;
+      const natW  = (imgEl.naturalWidth  > 0 ? imgEl.naturalWidth  : null) ?? refImgMeta?.cols ?? iElW;
+      const natH  = (imgEl.naturalHeight > 0 ? imgEl.naturalHeight : null) ?? refImgMeta?.rows ?? iElH;
+      const sc    = Math.min(iElW / natW, iElH / natH);
+      const cW    = natW * sc;
+      const cH    = natH * sc;
+      const top   = (iRect.top  - fRect.top)  + (iElH - cH) / 2;
+      const left  = (iRect.left - fRect.left) + (iElW - cW) / 2;
+      Object.assign(overlayEl.style, {
+        inset: 'unset', top: `${top}px`, left: `${left}px`,
+        width: `${cW}px`, height: `${cH}px`,
+      });
+    }
+    if (imgEl && imgEl.naturalWidth > 0) updateOverlay();
+    if (imgEl) imgEl.addEventListener('load', updateOverlay);
+
+    // Detect orientation from label text
+    const labelText = labelTextEl ? labelTextEl.textContent : '';
+    const isSag = /\bsag\b/i.test(labelText);
+    const isAx  = /\bax\b/i.test(labelText);
+
+    // Compute physical image extent for accurate cross-reference line placement.
+    // SAG: the line on SAG from an AX slice must land at the correct fraction of SAG's
+    //      cranio-caudal extent, not just at a proportional position within the AX range.
+    // AX:  similarly, the line on AX from a SAG plane must respect the AX image's L-R extent.
+    let physicalExtent = null;
+    const refImgMeta = images.find(i =>
+      Array.isArray(i.imagePosition)    && i.imagePosition.length === 3 &&
+      Array.isArray(i.imageOrientation) && i.imageOrientation.length === 6 &&
+      i.rows != null &&
+      Array.isArray(i.pixelSpacing)     && i.pixelSpacing.length >= 2
+    );
+    if (refImgMeta) {
+      const iop = refImgMeta.imageOrientation;
+      const ipp = refImgMeta.imagePosition;
+      const ps  = refImgMeta.pixelSpacing;
+      // Snap dominant direction cosines that may have been truncated by InteleBrowser
+      // (e.g. '-0.9998...' stored as -0.9 → snap to -1).  Only affects |val| ≥ 0.85.
+      const snap = v => (v != null && Math.abs(v) >= 0.85) ? Math.sign(v) : v;
+      const rawIop  = iop.slice();   // unsnapped — needed for oblique plane math
+      const rawIpp  = ipp.slice();
+      const nRows   = refImgMeta.rows;
+      const nCols   = refImgMeta.cols ?? refImgMeta.rows;
+      if (isSag) {
+        const cz      = snap(iop[5]);
+        const z0      = ipp[2];
+        const zExtent = (nRows - 1) * ps[0] * cz;
+        if (Math.abs(zExtent) > 1)
+          physicalExtent = { z0, zExtent, iop: rawIop, ipp: rawIpp, rows: nRows, cols: nCols, ps };
+      } else if (isAx) {
+        const rx      = snap(iop[0]);
+        const x0      = ipp[0];
+        const xExtent = (nCols - 1) * ps[1] * rx;
+        if (Math.abs(xExtent) > 1)
+          physicalExtent = { x0, xExtent, iop: rawIop, ipp: rawIpp, rows: nRows, cols: nCols, ps };
+      }
+    }
+
+    // Register in link group
+    const registration = {
+      colEl, isSag, isAx, physicalExtent, jumpToZ: null,
+      setReferenceLine(type, proportion) {
+        // proportion=null → hide the line (slice outside coverage).
+        // The overlay is sized to exactly the image content area by updateOverlay(),
+        // so top/left percentages map directly to image row/column proportions.
+        if (type === 'h') {
+          if (refLineD) refLineD.setAttribute('display', 'none');
+          if (!refLineH) return;
+          if (proportion == null) { refLineH.style.display = 'none'; return; }
+          updateOverlay();
+          refLineH.style.top     = `${proportion * 100}%`;
+          refLineH.style.display = 'block';
+        } else if (type === 'v') {
+          if (!refLineV) return;
+          if (proportion == null) { refLineV.style.display = 'none'; return; }
+          updateOverlay();
+          refLineV.style.left    = `${proportion * 100}%`;
+          refLineV.style.display = 'block';
+        } else if (type === 'd') {
+          if (refLineH) refLineH.style.display = 'none';
+          if (!refLineD) return;
+          if (proportion == null) { refLineD.setAttribute('display', 'none'); return; }
+          updateOverlay();
+          const { x1, y1, x2, y2 } = proportion;
+          refLineD.setAttribute('x1', `${x1 * 100}%`);
+          refLineD.setAttribute('y1', `${y1 * 100}%`);
+          refLineD.setAttribute('x2', `${x2 * 100}%`);
+          refLineD.setAttribute('y2', `${y2 * 100}%`);
+          refLineD.setAttribute('display', '');
+        }
+      },
+      triggerUpdate() { updateReferenceLines(); },
+    };
+    // Expose jump-to-Z for axial columns (called by sagittal click)
+    if (isAx) {
+      registration.jumpToZ = function(targetZ) {
+        let bestIdx = 0, bestDist = Infinity;
+        for (let i = 0; i < images.length; i++) {
+          const z = images[i].imagePosition?.[2] ?? images[i].sliceLocation;
+          if (z != null && isFinite(z)) {
+            const d = Math.abs(z - targetZ);
+            if (d < bestDist) { bestDist = d; bestIdx = i; }
+          }
+        }
+        setSlice(bestIdx);
+      };
+    }
+    // Sagittal columns with physical extent get a crosshair cursor (jump-to-disc hint)
+    if (isSag && physicalExtent) colEl.classList.add('sag-jumpable');
+
+    if (linkGroupId) {
+      if (!mriLinkGroups[linkGroupId]) mriLinkGroups[linkGroupId] = [];
+      mriLinkGroups[linkGroupId] = mriLinkGroups[linkGroupId].filter(r => r.colEl !== colEl);
+      mriLinkGroups[linkGroupId].push(registration);
+    }
+
+    function updateReferenceLines() {
+      if (!linkGroupId || images.length <= 1) return;
+      const group = mriLinkGroups[linkGroupId];
+      if (!group) return;
+
+      const img = images[currentIdx];
+      if (!img) return;
+
+      for (const reg of group) {
+        if (reg.colEl === colEl) continue;
+
+        if (isSag && reg.isAx && reg.physicalExtent) {
+          // Use LPS X coordinate directly — avoids SliceLocation sign ambiguity
+          const sagX = img.imagePosition?.[0];
+          if (sagX == null || !isFinite(sagX)) continue;
+          const { x0, xExtent } = reg.physicalExtent;
+          const raw = (sagX - x0) / xExtent;
+          const prop = (raw >= 0 && raw <= 1) ? raw : null;
+          reg.setReferenceLine('v', prop);
+        } else if (isAx && reg.isSag && reg.physicalExtent) {
+          const axIpp = img.imagePosition;
+          const axIop = img.imageOrientation;   // per-slice — correct for multi-angle series
+          if (axIpp && axIop && reg.physicalExtent.iop) {
+            // Compute the true intersection of this oblique axial plane with the sagittal image
+            const diag = computeObliqueRefLine(axIpp, axIop, reg.physicalExtent);
+            reg.setReferenceLine('d', diag);
+          } else {
+            // Fallback: simple horizontal line at Z position
+            const axZ = axIpp?.[2];
+            if (axZ == null || !isFinite(axZ)) continue;
+            const { z0, zExtent } = reg.physicalExtent;
+            const raw = (axZ - z0) / zExtent;
+            reg.setReferenceLine('h', (raw >= 0 && raw <= 1) ? raw : null);
+          }
+        }
+      }
+    }
 
     function setSlice(idx) {
       currentIdx = Math.max(0, Math.min(idx, images.length - 1));
       imgEl.src = images[currentIdx].url;
       imgEl.alt = String(currentIdx + 1);
       if (counterEl) counterEl.textContent = `${currentIdx + 1}/${images.length}`;
+      pushCastImage(images[currentIdx].url);
+      updateReferenceLines();
     }
 
-    imgEl.addEventListener('click', () => openFullscreen(images, currentIdx));
+    const ac  = new AbortController();
+    const sig = ac.signal;
+
+    imgEl.addEventListener('click', e => {
+      // Sagittal + physical metadata: single click jumps all axial columns to clicked Z
+      if (isSag && linkGroupId && physicalExtent) {
+        const fRect = frameEl.getBoundingClientRect();
+        const iRect = imgEl.getBoundingClientRect();
+        const iElH  = iRect.height || 1;
+        const natH  = imgEl.naturalHeight > 0 ? imgEl.naturalHeight : (physicalExtent.rows ?? iElH);
+        const natW  = imgEl.naturalWidth  > 0 ? imgEl.naturalWidth  : (physicalExtent.cols ?? iElH);
+        const sc    = Math.min((iRect.width || 1) / natW, iElH / natH);
+        const cH    = natH * sc;
+        const topOff = (iRect.top - fRect.top) + (iElH - cH) / 2;
+        const yFrac  = Math.max(0, Math.min(1, ((e.clientY - fRect.top) - topOff) / cH));
+        const targetZ = physicalExtent.z0 + yFrac * physicalExtent.zExtent;
+        const group = mriLinkGroups[linkGroupId];
+        if (group) { for (const reg of group) { if (reg.isAx && reg.jumpToZ) reg.jumpToZ(targetZ); } }
+        return; // don't open fullscreen on single click
+      }
+      openFullscreen(images, currentIdx);
+    }, { signal: sig });
+    // Double-click on sagittal still opens fullscreen
+    if (isSag) imgEl.addEventListener('dblclick', () => openFullscreen(images, currentIdx), { signal: sig });
 
     // Mouse wheel: scroll through slices
     colEl.addEventListener('wheel', e => {
       e.preventDefault();
       if (e.deltaY > 0) setSlice(currentIdx + 1);
       else if (e.deltaY < 0) setSlice(currentIdx - 1);
-    }, { passive: false });
+    }, { passive: false, signal: sig });
 
     // Touch swipe up/down: scroll through slices
     let touchStartY = 0;
     colEl.addEventListener('touchstart', e => {
       touchStartY = e.touches[0].clientY;
-    }, { passive: true });
+    }, { passive: true, signal: sig });
     colEl.addEventListener('touchend', e => {
       const dy = touchStartY - e.changedTouches[0].clientY;
       if (Math.abs(dy) > 25) setSlice(currentIdx + (dy > 0 ? 1 : -1));
-    }, { passive: true });
+    }, { passive: true, signal: sig });
+
+    // Series swap dropdown
+    if (seriesList && seriesList.length > 1 && labelEl && labelTextEl) {
+      labelEl.classList.add('has-swap');
+      if (!labelEl.querySelector('.mri-swap-arrow')) {
+        const arrowSpan = document.createElement('span');
+        arrowSpan.className = 'mri-swap-arrow';
+        arrowSpan.textContent = '▾';
+        labelEl.insertBefore(arrowSpan, counterEl);
+      }
+
+      let menuEl = null;
+
+      function closeMenu() {
+        if (menuEl) { menuEl.remove(); menuEl = null; }
+        document.removeEventListener('click', onOutsideClick);
+      }
+      function onOutsideClick(e) {
+        if (menuEl && !menuEl.contains(e.target) && !labelEl.contains(e.target)) closeMenu();
+      }
+
+      labelEl.addEventListener('click', e => {
+        e.stopPropagation();
+        if (menuEl) { closeMenu(); return; }
+        const currentSeriesKey = images[0]?.seriesKey;
+        const otherSeries = seriesList.filter(s => s.seriesKey !== currentSeriesKey);
+        if (otherSeries.length === 0) return;
+        menuEl = document.createElement('ul');
+        menuEl.className = 'series-swap-menu';
+        for (const s of otherSeries) {
+          const li = document.createElement('li');
+          li.textContent = s.seriesLabel;
+          li.addEventListener('click', ev => {
+            ev.stopPropagation();
+            closeMenu();
+            swapSeriesInColumn(colEl, s, seriesList, linkGroupId);
+          });
+          menuEl.appendChild(li);
+        }
+        labelEl.appendChild(menuEl);
+        setTimeout(() => document.addEventListener('click', onOutsideClick), 0);
+      }, { signal: sig });
+    }
+
+    // Store cleanup so next call or swap can tear down listeners + group registration
+    colEl._mriCleanup = () => {
+      ac.abort();
+      if (imgEl) imgEl.removeEventListener('load', updateOverlay);
+      if (linkGroupId && mriLinkGroups[linkGroupId]) {
+        mriLinkGroups[linkGroupId] = mriLinkGroups[linkGroupId].filter(r => r.colEl !== colEl);
+      }
+      colEl._mriCleanup = null;
+    };
 
     setSlice(currentIdx);
   }
@@ -1307,6 +1831,7 @@
     document.getElementById('imageCounter').textContent =
       `${currentIndex + 1} / ${filteredImages.length}`;
     document.querySelectorAll('.thumb').forEach((t, i) => t.classList.toggle('active', i === currentIndex));
+    pushCastImage(filteredImages[currentIndex].url);
   }
 
   function nextImage() { if (currentIndex < filteredImages.length - 1) showImage(currentIndex + 1); }
@@ -1326,6 +1851,7 @@
     document.getElementById('fsImage').src = fsImages[fsIndex].url || fsImages[fsIndex];
     updateFsCounter();
     document.getElementById('fullscreenOverlay').classList.add('open');
+    pushCastImage(fsImages[fsIndex].url || fsImages[fsIndex], true);
   }
 
   function closeFullscreen() {
@@ -1336,6 +1862,7 @@
     fsIndex = Math.max(0, Math.min(fsIndex + dir, fsImages.length - 1));
     document.getElementById('fsImage').src = fsImages[fsIndex].url || fsImages[fsIndex];
     updateFsCounter();
+    pushCastImage(fsImages[fsIndex].url || fsImages[fsIndex], true);
   }
 
   function updateFsCounter() {
@@ -1343,6 +1870,75 @@
     const study = img.study ? img.study.split(' - ')[0] : '';
     document.getElementById('fsCounter').textContent =
       `${study ? study + '  ·  ' : ''}${fsIndex + 1} / ${fsImages.length}`;
+  }
+
+  // ── Cast ──
+
+  function setCastRoom(room) {
+    if (castActiveRoom === room) {
+      // Toggle off — uncast this room
+      castActiveRoom = null;
+      fetch(`${API}/api/cast/${room}`, { method: 'DELETE' }).catch(() => {});
+      document.querySelectorAll('.cast-btn').forEach(b => b.classList.remove('active'));
+      return;
+    }
+    // Switch to new room (server clears all others automatically)
+    castActiveRoom = room;
+    document.querySelectorAll('.cast-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(`cast${room.charAt(0).toUpperCase() + room.slice(1)}`).classList.add('active');
+
+    // Push the full viewer with the current patient loaded in display mode
+    if (snapshotPatientKey) {
+      const viewUrl = `${API}/viewer?patient=${encodeURIComponent(snapshotPatientKey)}&displaymode=1`;
+      fetch(`${API}/api/cast/${room}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: viewUrl }),
+      }).catch(() => {});
+    }
+  }
+
+  function getCurrentCastUrl() {
+    if (viewMode === 'single' && filteredImages[currentIndex]) return filteredImages[currentIndex].url;
+    if (document.getElementById('fullscreenOverlay').classList.contains('open')) {
+      return fsImages[fsIndex]?.url || fsImages[fsIndex] || null;
+    }
+    return lastVisibleUrl;  // row view / snapshot — use last scrolled image
+  }
+
+  function pushCastImage(url, immediate = false) {
+    // Navigation no longer pushes to the cast room.
+    // The cast room shows the full viewer (set once via setCastRoom).
+    if (url) lastVisibleUrl = url;
+  }
+
+  async function renameCastRoom(e, room) {
+    e.stopPropagation();
+    const id = `cast${room.charAt(0).toUpperCase() + room.slice(1)}`;
+    const btn = document.getElementById(id);
+    const name = prompt('Room name:', btn.textContent);
+    if (!name || name === btn.textContent) return;
+    try {
+      const r = await fetch(`${API}/api/cast/${room}/name`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (r.ok) btn.textContent = name;
+    } catch {}
+  }
+
+  async function loadRoomNames() {
+    for (const room of ['room1', 'room2', 'room3']) {
+      try {
+        const r = await fetch(`${API}/api/cast/${room}`);
+        if (!r.ok) continue;
+        const d = await r.json();
+        const id = `cast${room.charAt(0).toUpperCase() + room.slice(1)}`;
+        const btn = document.getElementById(id);
+        if (btn && d.name) btn.textContent = d.name;
+      } catch {}
+    }
   }
 
   // ── UI ──
@@ -1357,6 +1953,30 @@
     const bb = document.getElementById('bottomBar');
     if (bb.style.display !== 'none') bb.classList.toggle('hidden');
   }
+
+  // ── Brightness / Contrast ──
+  function toggleBC() {
+    const bar = document.getElementById('bcBar');
+    const open = bar.style.display === 'none';
+    bar.style.display = open ? 'flex' : 'none';
+    document.getElementById('bcBtn').classList.toggle('active', open);
+  }
+
+  function resetBC() {
+    document.getElementById('brightnessSlider').value = 100;
+    document.getElementById('contrastSlider').value = 100;
+    updateBC();
+  }
+
+  function updateBC() {
+    const b = document.getElementById('brightnessSlider').value / 100;
+    const c = document.getElementById('contrastSlider').value / 100;
+    document.documentElement.style.setProperty('--img-brightness', b);
+    document.documentElement.style.setProperty('--img-contrast', c);
+  }
+
+  document.getElementById('brightnessSlider').addEventListener('input', updateBC);
+  document.getElementById('contrastSlider').addEventListener('input', updateBC);
 
   function escHtml(s) {
     const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML;
@@ -1462,8 +2082,11 @@
   }
 
   // ── Auto-refresh ──
-  loadPatients();
+  loadPatients().then(() => {
+    if (_castPatient) selectPatient(decodeURIComponent(_castPatient));
+  });
   setInterval(loadPatients, 5000);
+  if (!_displayMode) loadRoomNames();
 </script>
 </body>
 </html>
