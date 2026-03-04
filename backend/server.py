@@ -43,7 +43,7 @@ def _find_tesseract() -> str:
 
 TESSERACT_CMD = _find_tesseract()
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
@@ -354,7 +354,7 @@ def clear_refresh(patient_key: str):
 
 # ── Cast Display ──
 
-_cast_state: dict = {"room1": "", "room2": "", "room3": ""}
+_cast_state: dict = {"room1": {}, "room2": {}, "room3": {}}
 
 ROOM_NAMES_PATH = DATA_DIR / "room_names.json"
 
@@ -370,36 +370,35 @@ def save_room_names(names: dict):
 _room_names: dict = load_room_names()
 
 
-class CastPayload(BaseModel):
-    url: str = ""
-
-
 @app.post("/api/cast/{room_key}")
-def set_cast_image(room_key: str, payload: CastPayload):
-    """Set the image for a room — exclusively (clears all other rooms)."""
+async def set_cast_image(room_key: str, request: Request):
+    """Set the cast state for a room — exclusively (clears all other rooms)."""
     if room_key not in _cast_state:
         raise HTTPException(status_code=404, detail="Unknown room")
+    data = await request.json()
     for r in _cast_state:
-        _cast_state[r] = ""
-    _cast_state[room_key] = payload.url
+        _cast_state[r] = {}
+    _cast_state[room_key] = data
     return {"status": "ok", "room": room_key}
 
 
 @app.delete("/api/cast/{room_key}")
 def clear_cast_image(room_key: str):
-    """Clear the cast image for a room."""
+    """Clear the cast state for a room."""
     if room_key not in _cast_state:
         raise HTTPException(status_code=404, detail="Unknown room")
-    _cast_state[room_key] = ""
+    _cast_state[room_key] = {}
     return {"status": "ok"}
 
 
 @app.get("/api/cast/{room_key}")
 def get_cast_image(room_key: str):
-    """Return the current image URL for a cast room (polled by display page)."""
+    """Return the current cast state for a room (polled by display page)."""
     if room_key not in _cast_state:
         raise HTTPException(status_code=404, detail="Unknown room")
-    return {"url": _cast_state.get(room_key, ""), "name": _room_names.get(room_key, room_key)}
+    state = dict(_cast_state.get(room_key, {}))
+    state["name"] = _room_names.get(room_key, room_key)
+    return state
 
 
 class RoomNamePayload(BaseModel):
@@ -425,28 +424,25 @@ def _cast_page_html(room_key: str) -> str:
   <style>
     * {{ margin:0; padding:0; box-sizing:border-box; }}
     body {{ background:#000; width:100vw; height:100vh; overflow:hidden;
-            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
-    #castFrame {{ position:fixed; inset:0; width:100%; height:100%; border:none; display:none; }}
+            font-family:-apple-system,BlinkMacSystemFont,'SF Pro',sans-serif; }}
+    iframe {{ position:fixed; inset:0; width:100%; height:100%; border:none; display:none; }}
     #idle {{
       position:fixed; inset:0; display:flex; flex-direction:column;
-      align-items:center; justify-content:center; gap:16px;
+      align-items:center; justify-content:center; background:#000;
     }}
-    .idle-name {{ color:#1e293b; font-size:36px; font-weight:700; letter-spacing:.05em; }}
-    .idle-sub  {{ color:#0f172a; font-size:16px; }}
+    #idle h1 {{ font-size:36px; font-weight:300; color:#334155; margin-bottom:14px; }}
+    #idle p  {{ font-size:18px; color:#1e293b; }}
   </style>
 </head>
 <body>
-  <iframe id="castFrame" allowfullscreen></iframe>
   <div id="idle">
-    <div class="idle-name">{name}</div>
-    <div class="idle-sub">Waiting for image…</div>
+    <h1 id="roomTitle">{name}</h1>
+    <p>Awaiting images&hellip;</p>
   </div>
+  <iframe id="castFrame" src="/viewer?room={room_key}&displaymode=1" allowfullscreen></iframe>
   <script>
-    let currentUrl = null;
     let currentName = {json.dumps(name)};
-    const frame = document.getElementById('castFrame');
-    const idle  = document.getElementById('idle');
-
+    let isActive = false;
     async function poll() {{
       try {{
         const r = await fetch('/api/cast/{room_key}');
@@ -455,22 +451,16 @@ def _cast_page_html(room_key: str) -> str:
         if (d.name && d.name !== currentName) {{
           currentName = d.name;
           document.title = d.name;
-          document.querySelector('.idle-name').textContent = d.name;
+          document.getElementById('roomTitle').textContent = d.name;
         }}
-        if (d.url === currentUrl) return;
-        currentUrl = d.url;
-        if (d.url) {{
-          frame.src = d.url;
-          frame.style.display = 'block';
-          idle.style.display = 'none';
-        }} else {{
-          frame.style.display = 'none';
-          frame.src = '';
-          idle.style.display = 'flex';
+        const hasPatient = !!(d.patientKey);
+        if (hasPatient !== isActive) {{
+          isActive = hasPatient;
+          document.getElementById('idle').style.display  = hasPatient ? 'none' : 'flex';
+          document.getElementById('castFrame').style.display = hasPatient ? 'block' : 'none';
         }}
       }} catch(e) {{}}
     }}
-
     setInterval(poll, 1000);
     poll();
   </script>

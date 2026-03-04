@@ -595,6 +595,50 @@
     // Read-only room display — hide all controls
     document.getElementById('sidebar').classList.add('collapsed');
     document.getElementById('viewerHeader').style.display = 'none';
+
+    const _castRoom = _urlParams.get('room');
+    if (_castRoom) {
+      let _lastSyncStr = '';
+      async function syncCastState() {
+        try {
+          const r = await fetch(`${API}/api/cast/${_castRoom}`);
+          if (!r.ok) return;
+          const d = await r.json();
+          if (!d.patientKey) { _lastSyncStr = ''; return; }
+
+          const syncStr = `${d.patientKey}|${d.studyKey}|${d.imgIndex}|${d.viewMode}|${d.region}`;
+          if (syncStr === _lastSyncStr) return;
+          _lastSyncStr = syncStr;
+
+          // Switch patient if needed
+          const curKey = document.querySelector('.patient-item.active')?.dataset.key;
+          if (d.patientKey !== curKey) {
+            await selectPatient(d.patientKey);
+          }
+
+          // Apply region filter
+          if (d.region && d.region !== activeRegion) setRegionFilter(d.region);
+
+          // Apply view mode
+          if (d.viewMode === 'row' && d.studyKey) {
+            if (d.studyKey !== activeStudyKey) openStudyRow(d.studyKey);
+          } else if (d.viewMode === 'snapshot') {
+            if (viewMode !== 'snapshot') toggleSnapshotMode();
+          } else {
+            // 'single' or any other value
+            if (viewMode === 'snapshot') exitSnapshotMode();
+            if (viewMode === 'row') {
+              viewMode = 'single';
+              document.getElementById('rowView').style.display = 'none';
+              document.getElementById('imageContainer').style.display = 'flex';
+            }
+            if (typeof d.imgIndex === 'number') showImage(d.imgIndex);
+          }
+        } catch(e) {}
+      }
+      setInterval(syncCastState, 1000);
+      syncCastState();
+    }
   }
 
   // State
@@ -606,6 +650,7 @@
   let viewMode      = 'single'; // 'single' | 'row' | 'compare'
   let compareTopStudyKey    = null;
   let compareBottomStudyKey = null;
+  let activeStudyKey        = null; // study currently shown in row/MRI view
 
   // Snapshot mode state
   let snapshotPatientKey = null;
@@ -637,10 +682,15 @@
 
   // Region keywords
   const REGION_KW = {
-    lumbar:   ['lumbar', 'lumbosacral', 'l-spine', 'l spine', 'l1', 'l2', 'l3', 'l4', 'l5', 's1', 'sacrum', 'sacral', 'coccyx', 'scoliosis'],
-    cervical: ['cervical', 'c-spine', 'c spine', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'myelogram'],
-    thoracic: ['thoracic', 't-spine', 't spine', 't1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10', 't11', 't12'],
+    lumbar:   ['lumbar', 'lumbosacral', 'l-spine', 'l1', 'l2', 'l3', 'l4', 'l5', 's1', 'sacrum', 'sacral', 'coccyx'],
+    cervical: ['cervical', 'c-spine', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7'],
+    thoracic: ['thoracic', 't-spine'],
   };
+
+  // Returns true if the study base matches more than one region (e.g. "XR LUMBAR CERVICAL SPINE")
+  function isMultiRegionStudy(base) {
+    return Object.values(REGION_KW).filter(kws => kws.some(kw => base.includes(kw))).length > 1;
+  }
 
   // ── Touch / Swipe (single-image mode) ──
   let tx = 0, ty = 0, tt = 0;
@@ -845,6 +895,7 @@
 
   // ── Select Patient ──
   async function selectPatient(key) {
+    activeStudyKey = null;
     document.querySelectorAll('.patient-item').forEach(el => el.classList.remove('active'));
     const el = document.querySelector(`[data-key="${key}"]`);
     if (el) el.classList.add('active');
@@ -917,7 +968,7 @@
       renderStudyBar();
       currentIndex = 0;
       applyRegionFilter();
-      toggleSnapshotMode();
+      if (!_displayMode) toggleSnapshotMode();
 
       if (window.innerWidth <= 700) document.getElementById('sidebar').classList.remove('open');
     } catch (e) { console.error('selectPatient:', e); }
@@ -1322,6 +1373,7 @@
   function openStudyRow(studyKey) {
     if (viewMode === 'snapshot') exitSnapshotMode();
     viewMode = 'row';
+    activeStudyKey = studyKey;
     highlightStudyBtn(studyKey);
 
     // Hide single-image nav overlays — they sit at z-index 5, position:absolute,
@@ -1814,7 +1866,7 @@
     if (region === 'all') return true;
     const kws = REGION_KW[region] || [];
     const base = (studyDesc || '').split(' - ')[0].toLowerCase();
-    return kws.some(kw => base.includes(kw));
+    return kws.some(kw => base.includes(kw)) && !isMultiRegionStudy(base);
   }
 
   function updateStudyBarVisibility() {
@@ -1835,9 +1887,9 @@
       const kws = REGION_KW[activeRegion] || [];
       filteredImages = allImages.filter(img => {
         // Only match on the study description BEFORE any " - " series suffix
-        // (series description can be contaminated by nearby strings in the GWT table)
         const base = (img.study || '').split(' - ')[0].toLowerCase();
-        return kws.some(kw => base.includes(kw));
+        // Must match target region, must NOT also match another region (multi-region → All only)
+        return kws.some(kw => base.includes(kw)) && !isMultiRegionStudy(base);
       });
     }
 
@@ -1919,40 +1971,51 @@
 
   function setCastRoom(room) {
     if (castActiveRoom === room) {
-      // Toggle off — uncast this room
       castActiveRoom = null;
       fetch(`${API}/api/cast/${room}`, { method: 'DELETE' }).catch(() => {});
       document.querySelectorAll('.cast-btn').forEach(b => b.classList.remove('active'));
       return;
     }
-    // Switch to new room (server clears all others automatically)
     castActiveRoom = room;
     document.querySelectorAll('.cast-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(`cast${room.charAt(0).toUpperCase() + room.slice(1)}`).classList.add('active');
+    pushCastState(true);
+  }
 
-    // Push the full viewer with the current patient loaded in display mode
-    if (snapshotPatientKey) {
-      const viewUrl = `${API}/viewer?patient=${encodeURIComponent(snapshotPatientKey)}&displaymode=1`;
-      fetch(`${API}/api/cast/${room}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: viewUrl }),
-      }).catch(() => {});
+  function buildCastState() {
+    if (!snapshotPatientKey) return null;
+    return {
+      patientKey: snapshotPatientKey,
+      studyKey:   activeStudyKey || null,
+      imgIndex:   currentIndex,
+      viewMode,
+      region:     activeRegion,
+    };
+  }
+
+  function pushCastState(immediate = false) {
+    const state = buildCastState();
+    if (!state || !castActiveRoom) return;
+    clearTimeout(castDebounceTimer);
+    if (immediate) {
+      _doCastPush(state);
+    } else {
+      castDebounceTimer = setTimeout(() => _doCastPush(state), 300);
     }
   }
 
-  function getCurrentCastUrl() {
-    if (viewMode === 'single' && filteredImages[currentIndex]) return filteredImages[currentIndex].url;
-    if (document.getElementById('fullscreenOverlay').classList.contains('open')) {
-      return fsImages[fsIndex]?.url || fsImages[fsIndex] || null;
-    }
-    return lastVisibleUrl;  // row view / snapshot — use last scrolled image
+  function _doCastPush(state) {
+    if (!castActiveRoom || !state) return;
+    fetch(`${API}/api/cast/${castActiveRoom}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state),
+    }).catch(() => {});
   }
 
   function pushCastImage(url, immediate = false) {
-    // Navigation no longer pushes to the cast room.
-    // The cast room shows the full viewer (set once via setCastRoom).
     if (url) lastVisibleUrl = url;
+    pushCastState(immediate);
   }
 
   async function renameCastRoom(e, room) {
