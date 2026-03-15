@@ -77,8 +77,10 @@ def load_index():
         data = json.loads(path.read_text())
         if "pending_refreshes" not in data:
             data["pending_refreshes"] = {}
+        if "pending_preloads" not in data:
+            data["pending_preloads"] = {}
         return data
-    return {"patients": {}, "pending_refreshes": {}, "updated": None}
+    return {"patients": {}, "pending_refreshes": {}, "pending_preloads": {}, "updated": None}
 
 def save_index(index):
     index["updated"] = datetime.now().isoformat()
@@ -156,8 +158,9 @@ async def ocr_image(image: UploadFile = File(...)):
 
 @app.post("/api/schedule/import")
 async def import_schedule(req: dict = {}):
-    """Accept a parsed schedule from epic_capture and register all patients."""
+    """Accept a parsed schedule from epic_capture / nightly loader and register all patients."""
     patients = req.get("patients", [])
+    clinic_date = req.get("clinic_date", "")  # YYYY-MM-DD for the clinic day
     registered = []
     index = _get_cached_index()
     for p in patients:
@@ -168,28 +171,43 @@ async def import_schedule(req: dict = {}):
         key = sanitize_filename(f"{name}_{dob}")
         clinic_time = p.get("time", "")
         provider = p.get("provider", "")
+        pt_clinic_date = p.get("clinic_date") or clinic_date
         if key not in index["patients"]:
             index["patients"][key] = {
-                "name": name, "dob": dob, "clinic_date": "",
+                "name": name, "dob": dob, "clinic_date": pt_clinic_date,
                 "clinic_time": clinic_time, "provider": provider,
                 "studies": {}, "image_count": 0,
                 "created_at": datetime.now().isoformat(),
             }
         else:
             pt = index["patients"][key]
+            if pt_clinic_date:
+                pt["clinic_date"] = pt_clinic_date
             if clinic_time:
                 pt["clinic_time"] = clinic_time
             if provider and not pt.get("provider"):
                 pt["provider"] = provider
         registered.append(key)
+    # Queue imported patients for full preload by the Chrome extension
     if registered:
+        preload_patients = []
+        for key in registered:
+            pt = index["patients"][key]
+            preload_patients.append({
+                "name": pt["name"],
+                "dob": pt["dob"],
+                "visitTime": pt.get("clinic_time", ""),
+                "provider": pt.get("provider", ""),
+            })
+        index.setdefault("pending_preloads", {})
+        index["pending_preloads"] = {
+            "patients": preload_patients,
+            "clinic_date": clinic_date,
+            "queued_at": datetime.now().isoformat(),
+        }
         save_index(index)
-    # Also store as pending refreshes so extension picks them up
-    for key in registered:
-        index.setdefault("pending_refreshes", {})[key] = datetime.now().isoformat()
-    if registered:
-        save_index(index)
-    return {"status": "ok", "registered": len(registered), "keys": registered}
+    return {"status": "ok", "registered": len(registered), "keys": registered,
+            "clinic_date": clinic_date}
 
 
 @app.post("/api/patients/register")
@@ -393,9 +411,19 @@ def list_patients():
             "image_count": data["image_count"],
             "study_count": len(data["studies"]),
         })
-    # Sort: primary = clinic_date descending, secondary = schedule entry order (created_at) ascending
-    patients.sort(key=lambda p: p.get("created_at", ""))           # secondary sort first (stable)
-    patients.sort(key=lambda p: p["clinic_date"] or "", reverse=True)  # primary sort preserves secondary
+    # Sort: primary = clinic_date descending, secondary = clinic_time ascending
+    def _time_sort_key(t):
+        """Convert '7:30 AM' / '1:00 PM' to sortable 24h value."""
+        t = t.strip()
+        if not t:
+            return "99:99"
+        try:
+            from datetime import datetime as _dt
+            return _dt.strptime(t, "%I:%M %p").strftime("%H:%M")
+        except ValueError:
+            return t
+    patients.sort(key=lambda p: _time_sort_key(p.get("clinic_time", "")))  # secondary sort first (stable)
+    patients.sort(key=lambda p: p["clinic_date"] or "", reverse=True)      # primary sort preserves secondary
     return {"patients": patients}
 
 
@@ -469,6 +497,24 @@ def clear_refresh(patient_key: str):
     global _dirty_count
     index = _get_cached_index()
     index.get("pending_refreshes", {}).pop(patient_key, None)
+    save_index(index)
+    _dirty_count = 0
+    return {"status": "cleared"}
+
+
+@app.get("/api/pending_preloads")
+def get_pending_preloads():
+    """Return queued preload batch (from schedule/import). Polled by extension."""
+    index = _index_cache if _index_cache is not None else load_index()
+    return index.get("pending_preloads", {})
+
+
+@app.delete("/api/pending_preloads")
+def clear_pending_preloads():
+    """Clear pending preloads after extension has processed them."""
+    global _dirty_count
+    index = _get_cached_index()
+    index["pending_preloads"] = {}
     save_index(index)
     _dirty_count = 0
     return {"status": "cleared"}
@@ -1203,7 +1249,7 @@ def clear_all():
     if IMAGES_DIR.exists():
         shutil.rmtree(IMAGES_DIR)
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    _index_cache = {"patients": {}, "pending_refreshes": {}, "updated": None}
+    _index_cache = {"patients": {}, "pending_refreshes": {}, "pending_preloads": {}, "updated": None}
     save_index(_index_cache)
     _dirty_count = 0
     return {"status": "cleared"}
@@ -1232,8 +1278,8 @@ def sanitize_filename(name: str) -> str:
 # ── Run ──
 
 if __name__ == "__main__":
-    print("\n  🏥 PACS Preloader Server")
-    print("  ────────────────────────")
+    print("\n  PACS Preloader Server")
+    print("  ------------------------")
     print("  Viewer:  http://localhost:8888/viewer")
     print("  API:     http://localhost:8888/api/health")
     print("  Data:    ./pacs_data/")

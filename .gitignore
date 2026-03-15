@@ -7,6 +7,16 @@ venv/
 # PACS cached data (images + patient index — device-local, not for repo)
 pacs_data/
 
+# Chrome profile for PACS automation
+automation/.chrome-pacs-profile/
+
+# Automation logs and screenshots (contain patient data)
+automation/logs/
+automation/screenshots/
+automation/schedule_inbox/
+automation/schedule_archive/
+automation/templates/
+
 # OS
 .DS_Store
 Thumbs.db

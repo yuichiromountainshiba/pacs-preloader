@@ -12,11 +12,13 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log('[PACS Preloader] Extension installed');
   chrome.alarms.create('pollRefreshes', { periodInMinutes: 10 / 60 }); // every 10s
   chrome.alarms.create('checkVisitTimes', { periodInMinutes: 1 });    // every 1 min
+  chrome.alarms.create('pollPreloads', { periodInMinutes: 30 / 60 }); // every 30s
 });
 
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === 'pollRefreshes') pollPendingRefreshes();
   if (alarm.name === 'checkVisitTimes') checkVisitTimes().catch(console.error);
+  if (alarm.name === 'pollPreloads') pollPendingPreloads().catch(console.error);
 });
 
 // ── Message listener (from popup) ──
@@ -223,8 +225,8 @@ async function getFiltersFromStorage() {
   const spineRegions = saved.filterSpine !== false ? ['lumbar', 'cervical', 'thoracic'] : null;
   const modalities = [];
   if (saved.filterXR !== false) modalities.push('xr');
-  if (saved.filterCT) modalities.push('ct');
-  if (saved.filterMR) modalities.push('mr');
+  if (saved.filterCT !== false) modalities.push('ct');
+  if (saved.filterMR !== false) modalities.push('mr');
   return { spineRegions, modalities: modalities.length > 0 ? modalities : null };
 }
 
@@ -268,6 +270,53 @@ function sleep(ms) {
 }
 
 
+// ── Pending Preloads (from nightly loader / schedule import) ──
+// Polls for patients imported via /api/schedule/import and runs them through
+// the same full preload path as clicking "Preload Images" in the popup.
+async function pollPendingPreloads() {
+  if (isPreloading) return;
+
+  // Need a PACS tab to search
+  if (!pacsTabId) {
+    const allTabs = await chrome.tabs.query({}).catch(() => []);
+    const pacsTabs = allTabs.filter(t => t.url && t.url.includes('pacs.renoortho.com'));
+    if (!pacsTabs.length) return;
+    pacsTabId = pacsTabs[0].id;
+  }
+
+  try {
+    const saved = await chrome.storage.local.get(['serverUrl']);
+    const serverUrl = (saved.serverUrl || 'http://localhost:8888').replace(/\/$/, '');
+
+    const resp = await fetch(`${serverUrl}/api/pending_preloads`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+
+    if (!data.patients || data.patients.length === 0) return;
+
+    console.log(`[Preload] Found ${data.patients.length} pending patient(s) from schedule import`);
+
+    // Use full filters from storage — same as popup checkbox state
+    const filters = await getFiltersFromStorage();
+    const clinicDate = data.clinic_date || '';
+
+    // Clear the queue immediately so we don't re-trigger on next poll
+    await fetch(`${serverUrl}/api/pending_preloads`, { method: 'DELETE' }).catch(() => {});
+
+    // Run through the exact same path as clicking "Preload Images"
+    await runPreload({
+      patients: data.patients,
+      serverUrl,
+      clinicDate,
+      filters,
+      tabId: pacsTabId,
+    });
+  } catch (e) {
+    console.log('[Preload] poll error:', e.message);
+  }
+}
+
+
 // ── Pre-visit Auto-refresh ──
 // Queues a refresh for any patient whose clinic visit is within the next 5 minutes.
 async function checkVisitTimes() {
@@ -282,8 +331,13 @@ async function checkVisitTimes() {
   } catch (e) { return; }
 
   const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
   for (const p of (data.patients || [])) {
     if (!p.clinic_time || visitAutoQueued.has(p.key)) continue;
+
+    // Only auto-refresh for patients scheduled TODAY
+    if (!p.clinic_date || normalizeToIso(p.clinic_date) !== todayStr) continue;
+
     const visitDate = parseClinicTime(p.clinic_time);
     if (!visitDate) continue;
 
@@ -298,6 +352,20 @@ async function checkVisitTimes() {
       } catch (e) { console.error('[VisitTime] queue error:', e.message); }
     }
   }
+}
+
+/**
+ * Normalize a date string (YYYY-MM-DD or MM/DD/YYYY) to YYYY-MM-DD for comparison.
+ */
+function normalizeToIso(dateStr) {
+  if (!dateStr) return '';
+  // Already ISO: 2026-03-14
+  const iso = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return dateStr;
+  // US format: 3/14/2026 or 03/14/2026
+  const us = dateStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (us) return `${us[3]}-${us[1].padStart(2,'0')}-${us[2].padStart(2,'0')}`;
+  return dateStr;
 }
 
 function parseClinicTime(timeStr) {

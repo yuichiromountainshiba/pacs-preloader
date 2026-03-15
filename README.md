@@ -74,9 +74,32 @@ The extension needs icon files. Create simple placeholder icons:
 
 Or just use any small PNG and rename it.
 
+## Credential Setup
+
+Both Epic and PACS credentials are stored in Windows Credential Manager
+(DPAPI-encrypted, never in files):
+
+```bash
+cd automation
+python epic_capture.py --setup-credentials
+```
+
+This prompts for your Epic username/password and your PACS InteleBrowser
+username/password. To update, re-run the command — it overwrites existing entries.
+
+The nightly automation uses these credentials to:
+1. Open Chrome and log into PACS InteleBrowser automatically
+2. Launch and log into Epic Hyperspace automatically
+
+If your PACS URL differs from `pacs.renoortho.com`, update:
+- `automation/config.json` → `pacs.url`
+- `extension/manifest.json` → `host_permissions` and `content_scripts.matches`
+- `extension/popup.js` → the URL check in the init function
+- `extension/background.js` → the `pacs.renoortho.com` check in tab detection
+
 ## Usage
 
-### Preloading Images
+### Manual Preloading
 
 1. **Open InteleBrowser** in Chrome and **log in normally**
 2. Click the **PACS Preloader** extension icon (puzzle piece → pin it)
@@ -87,6 +110,31 @@ Or just use any small PNG and rename it.
    ```
 4. Click **Preload Images**
 5. The extension searches each patient and caches their images locally
+
+### Nightly Automation (Unattended)
+
+```bash
+# One-time setup
+cd automation
+python epic_capture.py --setup-credentials   # store Epic AND PACS credentials
+python epic_capture.py --record              # record UI templates (Epic elements only)
+
+# Test
+python nightly_loader.py --dry-run           # parse only, verify OCR output
+python nightly_loader.py                     # full run: Selenium PACS login → Epic → OCR → import → preload
+```
+
+**Nightly flow (fully automated):**
+1. **9 PM Mon-Fri:** Task Scheduler runs `run_nightly.bat` → starts server → opens Chrome with extension → logs into PACS via CDP JavaScript → launches Epic → logs in via pyautogui → captures next day's schedule → OCR → imports patients → extension auto-preloads overnight
+2. **7 AM Tue-Sat:** `send_summary.bat` emails HIPAA-safe summary (initials only)
+3. **During clinic:** Extension auto-refreshes XRs 1-5 minutes before each appointment
+
+Schedule via Windows Task Scheduler (no admin needed):
+```bash
+cd automation
+install_task.bat          # creates both 9PM + 7AM tasks
+install_task.bat /remove  # remove both tasks
+```
 
 ### Viewing on iPad
 

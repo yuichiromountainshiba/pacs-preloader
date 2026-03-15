@@ -1,0 +1,19 @@
+{
+  "epic": {
+    "exe_path": "C:\\Program Files (x86)\\Epic\\Hyperdrive\\VersionIndependent\\Hyperspace.exe",
+    "exe_args": ["--", "Id=750", "Env=prd", "tz=America/Los_Angeles"],
+    "credential_service": "pacs-preloader-epic",
+    "launch_timeout": 30,
+    "login_timeout": 20,
+    "context_screen_wait": 2,
+    "post_login_settle": 2.5
+  },
+  "pacs": {
+    "url": "https://pacs.renoortho.com/InteleBrowser/app",
+    "credential_service": "pacs-preloader-pacs",
+    "login_timeout": 15,
+    "page_load_wait": 2,
+    "username_selector": "#username",
+    "password_selector": "#password"
+  }
+}

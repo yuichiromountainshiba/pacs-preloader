@@ -3,3 +3,7 @@ opencv-python
 mss
 Pillow
 requests
+pdfplumber
+keyring
+pytesseract
+websocket-client
