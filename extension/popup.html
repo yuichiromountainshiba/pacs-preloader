@@ -122,7 +122,7 @@
   </style>
 </head>
 <body>
-  <h1>PACS Clinic Preloader</h1>
+  <h1 id="appTitle">PACS Clinic Preloader</h1>
   <p class="subtitle">Preload patient images for fast iPad viewing</p>
 
   <div id="pacsStatus" class="status-bar disconnected">
@@ -206,12 +206,8 @@ Doe, Jane  03/22/1980"></textarea>
 
   <div class="filter-section">
     <label>Filters</label>
-    <div class="filter-row">
-      <label class="checkbox-label"><input type="checkbox" id="filterSpine" checked> Spine only</label>
-      <div class="filter-divider"></div>
-      <label class="checkbox-label"><input type="checkbox" id="filterXR" checked> XR</label>
-      <label class="checkbox-label"><input type="checkbox" id="filterCT" checked> CT</label>
-      <label class="checkbox-label"><input type="checkbox" id="filterMR" checked> MRI</label>
+    <div class="filter-row" id="filterSection">
+      <!-- populated by popup.js buildFilterUI() from config.js -->
     </div>
   </div>
 
@@ -230,6 +226,7 @@ Doe, Jane  03/22/1980"></textarea>
   </div>
   <div id="log"></div>
 
+  <script src="config.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

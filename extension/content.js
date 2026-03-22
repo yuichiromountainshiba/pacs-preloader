@@ -472,25 +472,21 @@ function normalizeDob(dob) {
 // STUDY FILTERS  (identical to original)
 // ══════════════════════════════════════════════════════════════════════
 
-const SPINE_REGION_KEYWORDS = {
-  lumbar:   ['lumbar', 'lumbosacral', 'l-spine', 'l spine', 'l1', 'l2', 'l3', 'l4', 'l5', 's1', 'sacrum', 'sacral', 'coccyx', 'scoliosis', 'spine'],
-  cervical: ['cervical', 'c-spine', 'c spine', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'myelogram'],
-  thoracic: ['thoracic', 't-spine', 't spine', 't1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10', 't11', 't12'],
-};
-
-const MODALITY_FILTERS = { xr: ['XR','CR','DX','RF'], ct: ['CT'], mr: ['MR','MRI'] };
+// SUBSPECIALTY is provided by config.js, loaded before this script
+const REGION_KEYWORDS  = SUBSPECIALTY.regionKeywords;
+const MODALITY_FILTERS = SUBSPECIALTY.modalityCodes;
 
 function filterStudies(studies, options = {}) {
   let filtered = studies;
 
-  if (options.spineRegions && options.spineRegions.length > 0) {
+  if (options.regions && options.regions.length > 0) {
     filtered = filtered.filter(s => {
       const desc = (s.description || '').toLowerCase();
-      return options.spineRegions.some(region =>
-        (SPINE_REGION_KEYWORDS[region] || []).some(kw => desc.includes(kw))
+      return options.regions.some(region =>
+        (REGION_KEYWORDS[region] || []).some(kw => desc.includes(kw))
       );
     });
-    console.log(`[PACS-DOM] Spine filter: ${studies.length} → ${filtered.length}`);
+    console.log(`[PACS-DOM] Region filter (${SUBSPECIALTY.id}): ${studies.length} → ${filtered.length}`);
   }
 
   if (options.modalities && options.modalities.length > 0) {

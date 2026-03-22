@@ -1116,7 +1116,7 @@ def capture_schedule(target_date, dry_run=False, config=None):
         log.info("Already logged in — skipping login")
 
     epic_rect = get_window_rect(hwnd)
-    time.sleep(0.5)
+    time.sleep(1.5)
 
     # ── Step 2: Select schedule in My Schedule sidebar ──
     select_my_schedule(epic_rect)

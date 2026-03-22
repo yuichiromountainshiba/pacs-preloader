@@ -283,13 +283,8 @@ async function pollPendingRefreshes() {
 }
 
 async function getFiltersFromStorage() {
-  const saved = await chrome.storage.local.get(['filterSpine', 'filterXR', 'filterCT', 'filterMR']);
-  const spineRegions = saved.filterSpine !== false ? ['lumbar', 'cervical', 'thoracic'] : null;
-  const modalities = [];
-  if (saved.filterXR !== false) modalities.push('xr');
-  if (saved.filterCT !== false) modalities.push('ct');
-  if (saved.filterMR !== false) modalities.push('mr');
-  return { spineRegions, modalities: modalities.length > 0 ? modalities : null };
+  const saved = await chrome.storage.local.get(['lastFilters']);
+  return saved.lastFilters || { regions: null, modalities: ['xr', 'ct', 'mr'] };
 }
 
 

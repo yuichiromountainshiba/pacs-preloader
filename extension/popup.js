@@ -14,7 +14,7 @@ let ocrParsedPatients = [];
 let ocrProviders = [];
 const ocrSelectedProviders = new Set();
 
-const FILTER_KEYS = ['filterSpine', 'filterXR', 'filterCT', 'filterMR'];
+const FILTER_KEYS = SUBSPECIALTY.regionCheckboxes.map(cb => cb.id);
 const STORAGE_KEYS = ['schedule', 'serverUrl', 'clinicDate', ...FILTER_KEYS];
 
 // ── Init ──
@@ -38,13 +38,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Set title and build filter UI from config
+  document.getElementById('appTitle').textContent = SUBSPECIALTY.name !== 'Spine'
+    ? `PACS Preloader — ${SUBSPECIALTY.name}`
+    : 'PACS Clinic Preloader';
+  buildFilterUI();
+
   // Load saved settings
   const saved = await chrome.storage.local.get(STORAGE_KEYS);
   if (saved.schedule)   $('#schedule').value = saved.schedule;
   if (saved.serverUrl)  $('#serverUrl').value = saved.serverUrl;
+  else                  $('#serverUrl').value = SUBSPECIALTY.defaultServerUrl;
   if (saved.clinicDate) $('#clinicDate').value = saved.clinicDate;
-  // Persist the current serverUrl value (covers the case where user never changed it
-  // from the HTML default, so it was never written to storage for the service worker)
   if (!saved.serverUrl) chrome.storage.local.set({ serverUrl: $('#serverUrl').value });
   for (const id of FILTER_KEYS) {
     if (saved[id] != null) $(`#${id}`).checked = saved[id];
@@ -55,7 +60,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('#serverUrl').addEventListener('change', () => chrome.storage.local.set({ serverUrl: $('#serverUrl').value }));
   $('#clinicDate').addEventListener('change', () => chrome.storage.local.set({ clinicDate: $('#clinicDate').value }));
   for (const id of FILTER_KEYS) {
-    $(`#${id}`).addEventListener('change', () => chrome.storage.local.set({ [id]: $(`#${id}`).checked }));
+    $(`#${id}`).addEventListener('change', () => {
+      chrome.storage.local.set({ [id]: $(`#${id}`).checked });
+      chrome.storage.local.set({ lastFilters: getFilterOptions() });
+    });
   }
 
   $('#preloadBtn').addEventListener('click', startPreload);
@@ -194,17 +202,34 @@ async function clearCache() {
 
 
 // ── Helpers ──
+function buildFilterUI() {
+  const section = document.getElementById('filterSection');
+  let html = SUBSPECIALTY.regionCheckboxes.map(cb =>
+    `<label class="checkbox-label"><input type="checkbox" id="${cb.id}" checked> ${escHtml(cb.label)}</label>`
+  ).join('');
+  if (!SUBSPECIALTY.hideModalityFilters) {
+    html += `<div class="filter-divider"></div>
+      <label class="checkbox-label"><input type="checkbox" id="filterXR" checked> XR</label>
+      <label class="checkbox-label"><input type="checkbox" id="filterCT" checked> CT</label>
+      <label class="checkbox-label"><input type="checkbox" id="filterMR" checked> MRI</label>`;
+  }
+  section.innerHTML = html;
+}
+
 function getFilterOptions() {
-  const spineRegions = $('#filterSpine')?.checked
-    ? ['lumbar', 'cervical', 'thoracic']
-    : null;
+  const regions = SUBSPECIALTY.regionCheckboxes
+    .filter(cb => document.getElementById(cb.id)?.checked)
+    .flatMap(cb => cb.regions);
 
-  const modalities = [];
-  if ($('#filterXR')?.checked) modalities.push('xr');
-  if ($('#filterCT')?.checked) modalities.push('ct');
-  if ($('#filterMR')?.checked) modalities.push('mr');
+  const modalities = SUBSPECIALTY.hideModalityFilters
+    ? Object.keys(SUBSPECIALTY.modalityCodes)
+    : ['xr', 'ct', 'mr'].filter(m => {
+        if (m === 'xr') return $('#filterXR')?.checked;
+        if (m === 'ct') return $('#filterCT')?.checked;
+        if (m === 'mr') return $('#filterMR')?.checked;
+      });
 
-  return { spineRegions, modalities: modalities.length > 0 ? modalities : null };
+  return { regions: regions.length > 0 ? regions : null, modalities: modalities.length > 0 ? modalities : null };
 }
 
 function sendToTab(tabId, action, data) {
