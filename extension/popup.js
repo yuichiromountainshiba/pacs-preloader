@@ -232,7 +232,8 @@ function log(msg, cls = 'info') {
 }
 
 function openViewer() {
-  chrome.tabs.create({ url: `${$('#serverUrl').value.replace(/\/$/, '')}/viewer` });
+  const params = (typeof SUBSPECIALTY !== 'undefined' && SUBSPECIALTY.viewerParams) ? SUBSPECIALTY.viewerParams : '';
+  chrome.tabs.create({ url: `${$('#serverUrl').value.replace(/\/$/, '')}/viewer${params}` });
 }
 
 

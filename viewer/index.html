@@ -428,6 +428,10 @@
       list-style: none; margin: 0; min-width: 140px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.6);
     }
+    /* In compare halves, label is at the bottom — open menu upward */
+    .compare-images-half .mri-series-label .series-swap-menu {
+      top: auto; bottom: 100%;
+    }
     .series-swap-menu li {
       padding: 6px 12px; font-size: 0.78rem; cursor: pointer; color: #ddd;
     }
@@ -597,6 +601,10 @@
   const _urlParams   = new URLSearchParams(window.location.search);
   const _castPatient = _urlParams.get('patient');
   const _displayMode = _urlParams.has('displaymode');
+  const _isHipKnee   = _urlParams.get('specialty') === 'hipknee';
+  if (_isHipKnee) {
+    document.getElementById('snapshotBtn').style.display = 'none';
+  }
   if (_displayMode) {
     // Read-only room display — hide all controls
     document.getElementById('sidebar').classList.add('collapsed');
@@ -1051,7 +1059,10 @@
       renderStudyBar();
       currentIndex = 0;
       applyRegionFilter();
-      if (!_displayMode) toggleSnapshotMode();
+      if (!_displayMode) {
+        if (_isHipKnee) toggleCompareMode();
+        else toggleSnapshotMode();
+      }
 
       if (window.innerWidth <= 700) document.getElementById('sidebar').classList.remove('open');
     } catch (e) { console.error('selectPatient:', e); }
@@ -1438,12 +1449,12 @@
         el.innerHTML = seriesList.map(ser => {
           const mid = ser.middleIndex;
           return `<div class="mri-series-column">
+            <div class="mri-stack-frame">
+              <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+            </div>
             <div class="mri-series-label">
               <span class="mri-series-label-text">${escHtml(ser.seriesLabel)}</span>
               <span class="mri-slice-counter">${mid + 1}/${ser.images.length}</span>
-            </div>
-            <div class="mri-stack-frame">
-              <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
             </div>
           </div>`;
         }).join('');
