@@ -41,27 +41,48 @@ function postToPopup(msg) {
 
 
 // ── Preload loop ──
-async function runPreload({ patients, serverUrl, clinicDate, filters, tabId }) {
+async function runPreload({ patients, serverUrl, clinicDate, filters, tabId, tabConcurrency = 1 }) {
   if (isPreloading) return;
   isPreloading = true;
   pacsTabId = tabId;
   scheduledPatients = patients;
 
-  postToPopup({ action: 'preloadLog', text: `Starting preload: ${patients.length} patient(s)${clinicDate ? ' — clinic ' + clinicDate : ''}`, cls: 'info' });
+  const n = Math.min(Math.max(1, tabConcurrency), 4);
+  postToPopup({ action: 'preloadLog', text: `Starting preload: ${patients.length} patient(s)${clinicDate ? ' — clinic ' + clinicDate : ''}${n > 1 ? ` · ${n} parallel tabs` : ''}`, cls: 'info' });
 
+  const { tabIds, openedByUs } = await openPacsTabs(n, tabId);
+  pacsTabId = tabIds[0]; // keep primary tab for auto-refresh recovery
+  console.log(`[Preload] tabs: ${tabIds.join(', ')} | opened by us: ${openedByUs.join(', ') || 'none'}`);
+
+  // Distribute patients round-robin across tabs
+  const queues = tabIds.map(() => []);
+  patients.forEach((pt, i) => queues[i % tabIds.length].push({ pt, globalIndex: i }));
+
+  let completedCount = 0;
   let totalImages = 0;
-  for (let i = 0; i < patients.length; i++) {
-    const pt = patients[i];
-    postToPopup({ action: 'preloadProgress', current: i, total: patients.length, label: `Searching: ${pt.name}` });
-    postToPopup({ action: 'preloadLog', text: `\n[${i + 1}/${patients.length}] ${pt.name} (DOB: ${pt.dob})`, cls: 'info' });
-    try {
-      totalImages += await preloadPatient(pt, serverUrl, clinicDate, filters);
-    } catch (err) {
-      postToPopup({ action: 'preloadLog', text: `  ✗ Error: ${err.message}`, cls: 'error' });
-    }
-    // Ensure clinic_time is stored even if images were found (images path bypasses register)
-    if (pt.visitTime) await setPatientClinicTime(pt, serverUrl);
-    await sleep(500);
+
+  await Promise.all(tabIds.map((tid, wi) =>
+    (async () => {
+      for (const { pt, globalIndex } of queues[wi]) {
+        postToPopup({ action: 'preloadProgress', current: completedCount, total: patients.length, label: `Searching: ${pt.name}` });
+        postToPopup({ action: 'preloadLog', text: `\n[${globalIndex + 1}/${patients.length}] ${pt.name} (DOB: ${pt.dob}) [tab ${tid}]`, cls: 'info' });
+        console.log(`[Preload] tab ${tid} worker ${wi} → patient ${globalIndex + 1}/${patients.length}: ${pt.name}`);
+        try {
+          totalImages += await preloadPatient(pt, serverUrl, clinicDate, filters, tid);
+        } catch (err) {
+          postToPopup({ action: 'preloadLog', text: `  ✗ Error: ${err.message}`, cls: 'error' });
+        }
+        if (pt.visitTime) await setPatientClinicTime(pt, serverUrl);
+        completedCount++;
+        await sleep(300);
+      }
+    })()
+  ));
+
+  // Close any tabs we opened (leave pre-existing PACS tabs alone)
+  for (const tid of openedByUs) {
+    console.log(`[Preload] closing tab ${tid}`);
+    chrome.tabs.remove(tid).catch(() => {});
   }
 
   postToPopup({ action: 'preloadProgress', current: patients.length, total: patients.length, label: 'Done!' });
@@ -71,9 +92,49 @@ async function runPreload({ patients, serverUrl, clinicDate, filters, tabId }) {
 }
 
 
+// ── Open / reuse PACS tabs for parallel preload ──
+async function openPacsTabs(n, seedTabId) {
+  const allTabs = await chrome.tabs.query({}).catch(() => []);
+  const pacsTabs = allTabs.filter(t => t.url && t.url.includes('pacs.renoortho.com'));
+
+  // Seed tab (user's active tab) goes first, then any other existing PACS tabs
+  const ordered = seedTabId
+    ? [pacsTabs.find(t => t.id === seedTabId), ...pacsTabs.filter(t => t.id !== seedTabId)].filter(Boolean)
+    : pacsTabs;
+
+  const tabIds = ordered.slice(0, n).map(t => t.id);
+  const openedByUs = [];
+
+  while (tabIds.length < n) {
+    const tab = await chrome.tabs.create({ url: 'https://pacs.renoortho.com/InteleBrowser/app', active: false });
+    tabIds.push(tab.id);
+    openedByUs.push(tab.id);
+    await waitForTabLoad(tab.id);
+    await sleep(1000); // settle time for PACS app JS to initialise
+  }
+
+  // Inject content script into all tabs (no-op if already injected)
+  for (const tid of tabIds) {
+    await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['content.js'] }).catch(() => {});
+    await sleep(150);
+  }
+
+  return { tabIds, openedByUs };
+}
+
+async function waitForTabLoad(tabId, timeout = 20000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.status === 'complete') return;
+    await sleep(500);
+  }
+}
+
+
 // ── Per-patient preload ──
-async function preloadPatient(pt, serverUrl, clinicDate, filters) {
-  const result = await sendToContentScript('searchPatient', {
+async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId) {
+  const result = await sendToContentScriptTab(tabId || pacsTabId, 'searchPatient', {
     name: pt.name,
     dob: pt.dob,
     filters,
@@ -105,7 +166,7 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters) {
   const eligibleStudies = result.studies.filter(s => s.series && s.series.length > 0);
   const sentResults = await Promise.all(
     eligibleStudies.map(study =>
-      sendToContentScript('batchPreloadStudy', {
+      sendToContentScriptTab(tabId || pacsTabId, 'batchPreloadStudy', {
         studyUid:         study.studyUid,
         series:           study.series,
         patient:          { name: pt.name, dob: pt.dob, provider: pt.provider || '' },
@@ -239,16 +300,18 @@ function buildPatientKey(pt) {
 }
 
 async function sendToContentScript(action, data) {
+  return sendToContentScriptTab(pacsTabId, action, data);
+}
+
+async function sendToContentScriptTab(tabId, action, data) {
   try {
-    return await _sendTabMessage(pacsTabId, action, data);
+    return await _sendTabMessage(tabId, action, data);
   } catch (e) {
     if (e.message.includes('Receiving end does not exist')) {
-      // Content script not loaded (tab opened before extension, or SW restarted).
-      // Inject it now and retry once.
-      console.log('[Refresh] content script missing — injecting into tab', pacsTabId);
-      await chrome.scripting.executeScript({ target: { tabId: pacsTabId }, files: ['content.js'] });
+      console.log('[Preload] content script missing — injecting into tab', tabId);
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
       await sleep(400);
-      return await _sendTabMessage(pacsTabId, action, data);
+      return await _sendTabMessage(tabId, action, data);
     }
     throw e;
   }

@@ -165,12 +165,13 @@ async function startPreload() {
 
   // Hand off to background — preload continues even if popup is closed
   chrome.runtime.sendMessage({
-    action:     'startPreload',
+    action:          'startPreload',
     patients,
     serverUrl,
     clinicDate,
-    filters:    getFilterOptions(),
-    tabId:      pacsTabId,
+    filters:         getFilterOptions(),
+    tabId:           pacsTabId,
+    tabConcurrency:  3,
   });
 }
 
