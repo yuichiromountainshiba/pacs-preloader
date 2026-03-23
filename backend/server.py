@@ -270,6 +270,7 @@ async def receive_image(
     pixel_spacing: str = Form(""),
     provider: str = Form(""),
     modality: str = Form(""),
+    location: str = Form(""),
 ):
     """Receive an image from the Chrome extension and store it locally."""
 
@@ -278,14 +279,14 @@ async def receive_image(
         return await _receive_image_locked(
             image, patient_name, patient_dob, study_uid, study_description,
             study_date, image_index, clinic_date, clinic_time, image_uid, slice_location,
-            image_position, image_orientation, rows, cols, pixel_spacing, provider, modality,
+            image_position, image_orientation, rows, cols, pixel_spacing, provider, modality, location,
         )
 
 
 async def _receive_image_locked(
     image, patient_name, patient_dob, study_uid, study_description,
     study_date, image_index, clinic_date, clinic_time, image_uid, slice_location,
-    image_position, image_orientation, rows, cols, pixel_spacing, provider, modality="",
+    image_position, image_orientation, rows, cols, pixel_spacing, provider, modality="", location="",
 ):
     global _dirty_count
     index = _get_cached_index()
@@ -327,10 +328,13 @@ async def _receive_image_locked(
             "description": study_description,
             "date": study_date,
             "modality": modality,
+            "location": location,
             "images": [],
         }
-    elif modality and not patient["studies"][study_key].get("modality"):
-        patient["studies"][study_key]["modality"] = modality
+    else:
+        s = patient["studies"][study_key]
+        if modality  and not s.get("modality"):  s["modality"]  = modality
+        if location  and not s.get("location"):  s["location"]  = location
 
     study = patient["studies"][study_key]
 
@@ -1282,11 +1286,15 @@ def sanitize_filename(name: str) -> str:
 # ── Run ──
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8888)
+    args = parser.parse_args()
     print("\n  PACS Preloader Server")
     print("  ------------------------")
-    print("  Viewer:  http://localhost:8888/viewer")
-    print("  API:     http://localhost:8888/api/health")
+    print(f"  Viewer:  http://localhost:{args.port}/viewer")
+    print(f"  API:     http://localhost:{args.port}/api/health")
     print("  Data:    ./pacs_data/")
     print("  Deps:    pip install pdfplumber  (for PDF schedule upload)")
     print()
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    uvicorn.run(app, host="0.0.0.0", port=args.port)

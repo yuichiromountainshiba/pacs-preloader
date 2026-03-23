@@ -490,6 +490,7 @@
         <div class="viewer-info">
           <div class="viewer-patient-name" id="viewerPatientName"></div>
           <div class="viewer-study-info"   id="viewerStudyInfo"></div>
+          <div class="viewer-study-location" id="viewerStudyLocation" style="font-size:10px;color:#64748b;margin-top:1px;display:none;"></div>
         </div>
       </div>
       <div class="study-bar" id="studyBar" style="display:none;"></div>
@@ -1000,7 +1001,7 @@
       for (const [studyKey, study] of Object.entries(data.studies)) {
         const desc = study.description || studyKey;
         const mod  = study.modality || '';
-        allStudies.push({ description: desc, date: study.date || '', key: studyKey, modality: mod });
+        allStudies.push({ description: desc, date: study.date || '', key: studyKey, modality: mod, location: study.location || '' });
         const isMri = isMriStudy(desc, mod);
         const isCt  = isCtStudy(desc, mod);
         const sortedImages = [...(study.images || [])].sort((a, b) => {
@@ -1023,6 +1024,7 @@
             url:      `${API}/api/images/${key}/${img.filename}`,
             study:    desc,
             date:     study.date || '',
+            location: study.location || '',
             studyKey: studyKey,
           };
           if (isMri || isCt) {
@@ -1477,6 +1479,13 @@
     renderCompareHalf(bottomEl, compareBottomStudyKey, bottomStudyDesc, bottomImgs, 'compareBottomImagesArray');
   }
 
+  function setStudyInfo(text, location) {
+    document.getElementById('viewerStudyInfo').textContent = text;
+    const locEl = document.getElementById('viewerStudyLocation');
+    if (location) { locEl.textContent = location; locEl.style.display = ''; }
+    else { locEl.textContent = ''; locEl.style.display = 'none'; }
+  }
+
   // ── Row View (chip clicked) ──
   function openStudyRow(studyKey) {
     if (viewMode === 'snapshot') exitSnapshotMode();
@@ -1489,9 +1498,10 @@
     // covering the left/right 70px and would block the MRI pagination buttons.
     document.querySelectorAll('.nav-overlay').forEach(el => el.style.display = 'none');
 
-    const studyObj = allStudies.find(s => s.key === studyKey);
+    const studyObj  = allStudies.find(s => s.key === studyKey);
     const studyDesc = studyObj ? studyObj.description : studyKey;
     const studyMod  = studyObj ? (studyObj.modality || '') : '';
+    const studyLoc  = studyObj ? (studyObj.location  || '') : '';
     const imgs = allImages.filter(img => img.studyKey === studyKey);
     const rowView = document.getElementById('rowView');
 
@@ -1507,8 +1517,7 @@
         rowView.style.display = 'flex';
         document.getElementById('imageContainer').style.display = 'none';
         document.getElementById('bottomBar').style.display = 'none';
-        document.getElementById('viewerStudyInfo').textContent =
-          `${studyDesc.split(' - ')[0]}  ·  ${imgs.length} image${imgs.length !== 1 ? 's' : ''}`;
+        setStudyInfo(`${studyDesc.split(' - ')[0]}  ·  ${imgs.length} image${imgs.length !== 1 ? 's' : ''}`, studyLoc);
         return;
       }
       rowView.classList.add('mri-view');
@@ -1521,8 +1530,7 @@
       rowView.style.display = 'flex';
       document.getElementById('imageContainer').style.display = 'none';
       document.getElementById('bottomBar').style.display = 'none';
-      document.getElementById('viewerStudyInfo').textContent =
-        `${studyDesc.split(' - ')[0]}  ·  ${seriesList.length} series`;
+      setStudyInfo(`${studyDesc.split(' - ')[0]}  ·  ${seriesList.length} series`, studyLoc);
     } else {
       rowView.classList.remove('mri-view');
       rowView.innerHTML = imgs.map((img, i) => `
@@ -1533,8 +1541,7 @@
       rowView.style.display = 'flex';
       document.getElementById('imageContainer').style.display = 'none';
       document.getElementById('bottomBar').style.display = 'none';
-      document.getElementById('viewerStudyInfo').textContent =
-        `${studyDesc.split(' - ')[0]}  ·  ${imgs.length} image${imgs.length !== 1 ? 's' : ''}`;
+      setStudyInfo(`${studyDesc.split(' - ')[0]}  ·  ${imgs.length} image${imgs.length !== 1 ? 's' : ''}`, studyLoc);
     }
   }
 
@@ -2016,7 +2023,7 @@
     } else {
       document.getElementById('mainImage').style.display = 'none';
       document.getElementById('bottomBar').style.display = 'none';
-      document.getElementById('viewerStudyInfo').textContent = 'No studies found';
+      setStudyInfo('No studies found', '');
       document.getElementById('imageCounter').textContent = '';
       document.getElementById('thumbStrip').innerHTML = '';
       noResults.style.display = 'flex';
@@ -2032,8 +2039,10 @@
     if (!filteredImages.length) return;
     currentIndex = Math.max(0, Math.min(index, filteredImages.length - 1));
     document.getElementById('mainImage').src = filteredImages[currentIndex].url;
-    document.getElementById('viewerStudyInfo').textContent =
-      `${filteredImages[currentIndex].study.split(' - ')[0]}  ·  ${currentIndex + 1} / ${filteredImages.length}`;
+    setStudyInfo(
+      `${filteredImages[currentIndex].study.split(' - ')[0]}  ·  ${currentIndex + 1} / ${filteredImages.length}`,
+      filteredImages[currentIndex].location || ''
+    );
     document.getElementById('imageCounter').textContent =
       `${currentIndex + 1} / ${filteredImages.length}`;
     document.querySelectorAll('.thumb').forEach((t, i) => t.classList.toggle('active', i === currentIndex));

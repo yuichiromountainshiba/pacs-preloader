@@ -223,6 +223,12 @@ function parseStudyTable() {
     mod:  headerCells.indexOf('Mod'),
     name: headerCells.indexOf('Patient Name'),
     dob:  headerCells.indexOf('DOB'),
+    loc:  Math.max(
+      headerCells.indexOf('Institution'),
+      headerCells.indexOf('Facility'),
+      headerCells.indexOf('Location'),
+      headerCells.indexOf('Site'),
+    ),
   };
 
   const results = [];
@@ -238,12 +244,21 @@ function parseStudyTable() {
     const studyUid = cells[col.uid]?.textContent.trim();
     if (!isUid(studyUid)) continue;
 
-    // Date: "2026-01-26 05:33 AM" → "20260126"
+    // Date parsing — handles multiple formats:
+    //   "2026-01-26 05:33 AM"  (PACS default)
+    //   "01/26/2026"           (US locale)
+    //   "20260126"             (YYYYMMDD raw)
     let studyDate = '';
     if (col.date >= 0) {
       const raw = cells[col.date]?.textContent.trim() || '';
-      const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
-      if (m) studyDate = m[1] + m[2] + m[3];
+      const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (iso) {
+        studyDate = iso[1] + iso[2] + iso[3];
+      } else {
+        const us = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        if (us) studyDate = us[3] + us[1].padStart(2,'0') + us[2].padStart(2,'0');
+        else if (/^\d{8}$/.test(raw)) studyDate = raw;
+      }
     }
 
     results.push({
@@ -253,6 +268,7 @@ function parseStudyTable() {
       modality:    col.mod  >= 0 ? (cells[col.mod]?.textContent.trim()  || '') : '',
       patientName: col.name >= 0 ? (cells[col.name]?.textContent.trim() || '') : '',
       patientDob:  col.dob  >= 0 ? (cells[col.dob]?.textContent.trim()  || '') : '',
+      location:    col.loc  >= 0 ? (cells[col.loc]?.textContent.trim()  || '') : '',
       row,
     });
   }
@@ -429,6 +445,7 @@ async function searchPatientDOM(name, dob, debug = false) {
       patientName: sr.patientName || name.toUpperCase(),
       patientDob:  sr.patientDob ? (normalizeDob(sr.patientDob) || '') : '',
       modality:    sr.modality,
+      location:    sr.location || '',
       series:      seriesRows,
     });
 
@@ -539,13 +556,15 @@ async function pLimit(tasks, concurrency) {
  *
  * Called via the 'batchPreloadStudy' message from popup.js.
  */
-async function batchPreloadStudy({ studyUid, series, patient, studyDescription, studyDate, modality, serverUrl, clinicDate }) {
+async function batchPreloadStudy({ studyUid, series, patient, studyDescription, studyDate, modality, location: studyLocation, serverUrl, clinicDate }) {
   let resolvedStudyDate = studyDate || '';
+  let resolvedLocation  = studyLocation || '';
 
   // ── Step 1: ViewPatInfo for all series, 3 at a time ──
   const viewTasks = series.map(s => async () => {
     const result = await getStudyImages(studyUid, s.seriesUid);
     if (result.studyDate && !resolvedStudyDate) resolvedStudyDate = result.studyDate;
+    if (result.location  && !resolvedLocation)  resolvedLocation  = result.location;
     return { series: s, urls: result.urls || [], studyDate: result.studyDate || '' };
   });
 
@@ -574,7 +593,7 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
     if (!sr || !sr.urls.length) continue;
     const desc = studyDescription +
       (sr.series.description ? ' - ' + sr.series.description : '');
-    const sDate = sr.studyDate || resolvedStudyDate;
+    const sDate = resolvedStudyDate || sr.studyDate;   // DOM date wins over HTML fallback
 
     sr.urls.forEach((url, i) => {
       downloadTasks.push(async () => {
@@ -596,6 +615,7 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
           fd.append('study_description', desc.trim());
           fd.append('study_date',        sDate);
           fd.append('modality',          modality || '');
+          fd.append('location',          resolvedLocation || '');
           fd.append('image_index',       String(i));
           fd.append('clinic_date',       clinicDate || '');
           fd.append('image_uid',         imageUid);
@@ -648,6 +668,7 @@ async function getStudyImages(studyUid, seriesUid) {
   const allUrls = new Set();
   let curpos = 1;
   let studyDate = '';
+  let location  = '';
 
   while (true) {
     const formData = new URLSearchParams();
@@ -679,13 +700,21 @@ async function getStudyImages(studyUid, seriesUid) {
           console.log('[PACS-DOM] SessionHost:', hostMatch[1]);
         }
         if (!studyDate) {
-          const fld = html.match(/name=["']?(?:StudyDate|studyDate|study_date)["']?\s+value=["'](\d{8})["']/i);
-          if (fld) { studyDate = fld[1]; }
-          else {
-            const raw = html.match(/\b(20[12]\d(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))\b/);
-            if (raw) studyDate = raw[1];
+          // Prefer DICOM StudyDate tag (0008,0020) — most reliable
+          const dicomDate = html.match(/\(0008,0020\)[^\[]*\[(\d{8})\]/);
+          if (dicomDate) {
+            studyDate = dicomDate[1];
+          } else {
+            // Named form field
+            const fld = html.match(/name=["']?(?:StudyDate|studyDate|study_date)["']?\s+value=["'](\d{8})["']/i);
+            if (fld) studyDate = fld[1];
           }
           if (studyDate) console.log('[PACS-DOM] Study date:', studyDate);
+        }
+        if (!location) {
+          // DICOM InstitutionName (0008,0080)
+          const instM = html.match(/\(0008,0080\)[^\[]*\[([^\]]+)\]/);
+          if (instM) location = instM[1].trim();
         }
       }
 
@@ -705,8 +734,8 @@ async function getStudyImages(studyUid, seriesUid) {
     }
   }
 
-  console.log(`[PACS-DOM] Total images: ${allUrls.size}`);
-  return { urls: [...allUrls], studyDate };
+  console.log(`[PACS-DOM] Total images: ${allUrls.size} location: "${location}"`);
+  return { urls: [...allUrls], studyDate, location };
 }
 
 function extractImageUrls(html) {
