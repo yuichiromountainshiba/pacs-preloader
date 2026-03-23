@@ -238,6 +238,9 @@ async def register_patient(
     else:
         dirty = False
         pt = index["patients"][patient_key]
+        if clinic_date and pt.get("clinic_date") != clinic_date:
+            pt["clinic_date"] = clinic_date
+            dirty = True
         if provider and not pt.get("provider"):
             pt["provider"] = provider
             dirty = True
@@ -307,7 +310,7 @@ async def _receive_image_locked(
         }
     else:
         pt = index["patients"][patient_key]
-        if clinic_date and not pt.get("clinic_date"):
+        if clinic_date:
             pt["clinic_date"] = clinic_date
         if clinic_time:
             pt["clinic_time"] = clinic_time
@@ -1261,6 +1264,40 @@ def clear_all():
     save_index(_index_cache)
     _dirty_count = 0
     return {"status": "cleared"}
+
+
+# ── Feedback ──
+
+FEEDBACK_LOG = DATA_DIR / "feedback.jsonl"
+
+@app.post("/api/feedback")
+async def submit_feedback(req: dict):
+    """Store a viewer feedback/bug report entry."""
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "message": str(req.get("message", "")).strip(),
+        "patient": str(req.get("patient", "")).strip(),
+        "page": str(req.get("page", "")).strip(),
+    }
+    if not entry["message"]:
+        raise HTTPException(status_code=400, detail="message required")
+    with open(FEEDBACK_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+    return {"status": "ok"}
+
+@app.get("/api/feedback")
+def get_feedback():
+    """Return all feedback entries."""
+    if not FEEDBACK_LOG.exists():
+        return {"entries": []}
+    entries = []
+    with open(FEEDBACK_LOG, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try: entries.append(json.loads(line))
+                except json.JSONDecodeError: pass
+    return {"entries": entries}
 
 
 # ── Viewer ──
