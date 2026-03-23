@@ -113,8 +113,10 @@ async function openPacsTabs(n, seedTabId) {
     await sleep(1000); // settle time for PACS app JS to initialise
   }
 
-  // Inject content script into all tabs (no-op if already injected)
+  // Inject content scripts into all tabs (no-op if already injected)
+  // config.js must come before content.js so SUBSPECIALTY is defined
   for (const tid of tabIds) {
+    await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['config.js'] }).catch(() => {});
     await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['content.js'] }).catch(() => {});
     await sleep(150);
   }
@@ -133,21 +135,24 @@ async function waitForTabLoad(tabId, timeout = 20000) {
 
 
 // ── Per-patient preload ──
-async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId) {
+async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { todayOnly = false } = {}) {
+  // Always register first so the patient appears in the viewer with the correct
+  // clinic_date immediately, regardless of whether image uploads succeed later.
+  await registerPatientPlaceholder(pt, serverUrl, clinicDate);
+
   const result = await sendToContentScriptTab(tabId || pacsTabId, 'searchPatient', {
     name: pt.name,
     dob: pt.dob,
     filters,
+    todayOnly,
   });
 
   if (result.error) {
     postToPopup({ action: 'preloadLog', text: `  ✗ Search error: ${result.error}`, cls: 'error' });
-    await registerPatientPlaceholder(pt, serverUrl, clinicDate);
     return 0;
   }
   if (!result.studies || result.studies.length === 0) {
     postToPopup({ action: 'preloadLog', text: `  ✗ No studies found — adding to viewer for manual refresh`, cls: 'error' });
-    await registerPatientPlaceholder(pt, serverUrl, clinicDate);
     return 0;
   }
 
@@ -271,7 +276,7 @@ async function pollPendingRefreshes() {
       console.log('[Refresh] starting preloadPatient for', patient.name);
       try {
         const ptClinicDate = clinicDate || patient.clinic_date || '';
-        await preloadPatient(patient, serverUrl, ptClinicDate, filters);
+        await preloadPatient(patient, serverUrl, ptClinicDate, filters, undefined, { todayOnly: true });
         await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' });
         console.log('[Refresh] done + cleared pending for', patient.name);
       } catch (e) {
@@ -305,6 +310,8 @@ async function sendToContentScriptTab(tabId, action, data) {
   } catch (e) {
     if (e.message.includes('Receiving end does not exist')) {
       console.log('[Preload] content script missing — injecting into tab', tabId);
+      // Must inject config.js first so SUBSPECIALTY is defined when content.js loads
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['config.js'] }).catch(() => {});
       await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
       await sleep(400);
       return await _sendTabMessage(tabId, action, data);

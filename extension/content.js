@@ -128,9 +128,17 @@ function findSearchButton() {
  * a recent date window. Best-effort; doesn't throw if not found.
  */
 function setDateFilterAllDates() {
+  return setDateFilterRadio('All Dates');
+}
+
+function setDateFilterToday() {
+  return setDateFilterRadio('Today');
+}
+
+function setDateFilterRadio(label) {
   const d = getActiveDoc();
   for (const span of d.querySelectorAll('span.gwt-RadioButton')) {
-    if (span.textContent.trim() === 'All Dates') {
+    if (span.textContent.trim() === label) {
       const input = span.querySelector('input[type="radio"]');
       if (input) { input.click(); return true; }
     }
@@ -331,7 +339,7 @@ function parseSeriesTable() {
 // MAIN DOM SEARCH FUNCTION
 // ══════════════════════════════════════════════════════════════════════
 
-async function searchPatientDOM(name, dob, debug = false) {
+async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   const log = msg => console.log('[PACS-DOM]', msg);
 
   // Clean name (strip middle initial — same as original)
@@ -349,9 +357,14 @@ async function searchPatientDOM(name, dob, debug = false) {
     throw new Error('input[name="patientName"] not found — is the Patient Search page open?');
   }
 
-  // ── Set date filter to "All Dates" ──
-  const dateSet = setDateFilterAllDates();
-  log(`Date filter set to All Dates: ${dateSet}`);
+  // ── Set date filter ──
+  if (todayOnly) {
+    const dateSet = setDateFilterToday();
+    log(`Date filter set to Today: ${dateSet}`);
+  } else {
+    const dateSet = setDateFilterAllDates();
+    log(`Date filter set to All Dates: ${dateSet}`);
+  }
   await sleep(100);
 
   // ── Snapshot current study UIDs ──
@@ -457,14 +470,21 @@ async function searchPatientDOM(name, dob, debug = false) {
   if (dob && result.length > 0) {
     const dobNorm = normalizeDob(dob);
     if (dobNorm) {
-      const filtered = result.filter(s => s.patientDob === dobNorm);
+      const filtered = result.filter(s => normalizeDob(s.patientDob) === dobNorm);
       if (filtered.length > 0) {
         log(`DOB filter: ${result.length} → ${filtered.length}`);
         result = filtered;
       } else {
-        log('DOB filter matched nothing — keeping all');
+        log(`DOB filter matched nothing — rejecting all (wrong patient). Expected DOB: ${dobNorm}, found: ${[...new Set(result.map(s => s.patientDob))]}`);
+        result = [];
       }
     }
+  }
+
+  // ── Reset date filter back to All Dates after a Today-only search ──
+  if (todayOnly) {
+    setDateFilterAllDates();
+    log('Date filter reset to All Dates');
   }
 
   const patientNamesFound = [...new Set(result.map(s => s.patientName).filter(Boolean))];
@@ -476,11 +496,20 @@ async function searchPatientDOM(name, dob, debug = false) {
 // NORMALIZE DOB  (identical to original)
 // ══════════════════════════════════════════════════════════════════════
 
+const MONTH_ABBR = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+
 function normalizeDob(dob) {
+  if (!dob) return null;
+  // MM/DD/YYYY
   const m = dob.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (m) return `${m[3]}${m[1].padStart(2,'0')}${m[2].padStart(2,'0')}`;
+  // YYYY-Mon-DD  (e.g. 1960-sep-26)
+  const ma = dob.match(/(\d{4})-([a-zA-Z]{3})-(\d{1,2})/);
+  if (ma) { const mm = MONTH_ABBR[ma[2].toLowerCase()]; if (mm) return `${ma[1]}${mm}${ma[3].padStart(2,'0')}`; }
+  // YYYY-MM-DD
   const iso = dob.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (iso) return `${iso[1]}${iso[2]}${iso[3]}`;
+  // YYYYMMDD
   if (/^\d{8}$/.test(dob)) return dob;
   return null;
 }
@@ -570,7 +599,16 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
 
   const seriesResults = await pLimit(viewTasks, 3);
 
-  // ── Step 1b: Fetch DICOM slice metadata in parallel for MRI/CT series ──
+  // ── Step 1b: Fetch institution name from first available image (all modalities) ──
+  // ViewPatInfo HTML doesn't contain DICOM tags — must use singleimage action
+  if (!resolvedLocation) {
+    const firstUrl = seriesResults.find(sr => sr?.urls?.length)?.urls[0];
+    if (firstUrl) {
+      resolvedLocation = await fetchInstitutionName(firstUrl);
+    }
+  }
+
+  // ── Step 1c: Fetch DICOM slice metadata in parallel for MRI/CT series ──
   const isMriOrCt = modality ? /^(MR|MRI|CT)$/i.test(modality) : /^(MR|MRI|CT)[\s\-]/i.test(studyDescription);
   const metadataMap = {};  // imageUrl → { sliceLocation, imagePosition }
   if (isMriOrCt) {
@@ -711,11 +749,6 @@ async function getStudyImages(studyUid, seriesUid) {
           }
           if (studyDate) console.log('[PACS-DOM] Study date:', studyDate);
         }
-        if (!location) {
-          // DICOM InstitutionName (0008,0080)
-          const instM = html.match(/\(0008,0080\)[^\[]*\[([^\]]+)\]/);
-          if (instM) location = instM[1].trim();
-        }
       }
 
       const pageUrls = extractImageUrls(html);
@@ -775,6 +808,21 @@ function getImageUidFromUrl(url) {
   } catch {
     return String(url || '');
   }
+}
+
+async function fetchInstitutionName(imageUrl) {
+  try {
+    const u = new URL(imageUrl, window.location.origin);
+    u.searchParams.set('action', 'singleimage');
+    const r = await fetch(u.toString(), { credentials: 'include' });
+    if (!r.ok) return '';
+    const html = await r.text();
+    // DICOM InstitutionName (0008,0080)
+    const m = html.match(/\(0008,0080\)[^\[]*\[([^\]]+)\]/);
+    const name = m ? m[1].trim() : '';
+    if (name) console.log('[PACS-DOM] Institution:', name);
+    return name;
+  } catch { return ''; }
 }
 
 async function fetchSliceMetadata(imageUrl) {
@@ -897,7 +945,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   switch (message.action) {
     case 'searchPatient':
-      searchPatientDOM(message.name, message.dob, message.debug || false)
+      searchPatientDOM(message.name, message.dob, message.debug || false, message.todayOnly || false)
         .then(result => {
           if (message.filters && result.studies) result.studies = filterStudies(result.studies, message.filters);
           // Strip non-serializable DOM elements (row) before crossing the message boundary
