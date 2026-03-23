@@ -92,6 +92,7 @@ _index_cache: dict = None   # in-memory index; None until first image arrives
 _index_lock = asyncio.Lock()  # serialises concurrent receive_image calls
 _dirty_count = 0
 FLUSH_EVERY = 10            # write to disk every N images
+_last_image_at: float = 0.0  # epoch seconds of most recent image POST
 
 def _get_cached_index() -> dict:
     global _index_cache
@@ -106,6 +107,33 @@ def _get_cached_index() -> dict:
 def health():
     """Extension checks this to verify server is running."""
     return {"status": "ok", "time": datetime.now().isoformat()}
+
+
+@app.get("/api/status")
+def get_status():
+    """Viewer polls this for live download status."""
+    import time
+    index = _index_cache if _index_cache is not None else load_index()
+    today = datetime.now().strftime("%Y-%m-%d")
+    patients = index.get("patients", {})
+    pending = index.get("pending_preloads", {})
+    pending_refreshes = index.get("pending_refreshes", {})
+
+    today_pts  = [p for p in patients.values() if (p.get("clinic_date") or "")[:10] == today]
+    total      = len(today_pts)
+    complete   = sum(1 for p in today_pts if p.get("image_count", 0) > 0)
+    pending_ct = len(pending.get("patients", []))
+
+    # "pulling" = image received within last 8 seconds
+    pulling = (time.time() - _last_image_at) < 8 if _last_image_at else False
+
+    return {
+        "pulling":          pulling,
+        "queued":           pending_ct,
+        "today_total":      total,
+        "today_complete":   complete,
+        "pending_refreshes": len(pending_refreshes),
+    }
 
 
 @app.post("/api/ocr")
@@ -291,7 +319,9 @@ async def _receive_image_locked(
     study_date, image_index, clinic_date, clinic_time, image_uid, slice_location,
     image_position, image_orientation, rows, cols, pixel_spacing, provider, modality="", location="",
 ):
-    global _dirty_count
+    global _dirty_count, _last_image_at
+    import time
+    _last_image_at = time.time()
     index = _get_cached_index()
     # Create / update patient
     patient_key = sanitize_filename(f"{patient_name}_{patient_dob}")

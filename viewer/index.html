@@ -36,6 +36,23 @@
     .fs-close .icon { width: 20px; height: 20px; }
     .fs-nav .icon { width: 28px; height: 28px; }
     .patient-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .sidebar-status {
+      padding: 7px 12px; border-top: 1px solid #1e293b;
+      font-size: 11px; display: flex; align-items: center; gap: 7px;
+      min-height: 32px; flex-shrink: 0;
+    }
+    .sidebar-status .ss-dot {
+      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+    }
+    .sidebar-status.ss-pulling  { color: #38bdf8; }
+    .sidebar-status.ss-pulling  .ss-dot { background: #38bdf8; animation: ss-pulse 1s infinite; }
+    .sidebar-status.ss-queued   { color: #fbbf24; }
+    .sidebar-status.ss-queued   .ss-dot { background: #fbbf24; }
+    .sidebar-status.ss-complete { color: #34d399; }
+    .sidebar-status.ss-complete .ss-dot { background: #34d399; }
+    .sidebar-status.ss-idle     { color: #475569; }
+    .sidebar-status.ss-idle     .ss-dot { background: #334155; }
+    @keyframes ss-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
     .patient-item { padding: 13px 16px; border-bottom: 1px solid #1e293b; cursor: pointer; transition: background 0.15s; }
     .patient-item.active, .patient-item:active { background: #1e3a5f; }
     .patient-name { font-size: 15px; font-weight: 500; color: #f1f5f9; }
@@ -475,6 +492,10 @@
       <div class="empty-state" id="emptyState">
         <p>No preloaded images yet.<br>Use the Chrome extension to preload.</p>
       </div>
+    </div>
+    <div class="sidebar-status ss-idle" id="sidebarStatus">
+      <div class="ss-dot"></div>
+      <span id="sidebarStatusText">—</span>
     </div>
   </div>
 
@@ -2322,6 +2343,38 @@
   });
   setInterval(loadPatients, 5000);
   if (!_displayMode) loadRoomNames();
+
+  // ── Sidebar download status bar ──
+  async function updateSidebarStatus() {
+    try {
+      const r = await fetch(`${API}/api/status`);
+      if (!r.ok) return;
+      const s = await r.json();
+      const el   = document.getElementById('sidebarStatus');
+      const text = document.getElementById('sidebarStatusText');
+      el.className = 'sidebar-status';
+      if (s.pulling) {
+        el.classList.add('ss-pulling');
+        text.textContent = s.today_complete > 0
+          ? `Downloading… ${s.today_complete} / ${s.today_total} done`
+          : 'Downloading…';
+      } else if (s.queued > 0) {
+        el.classList.add('ss-queued');
+        text.textContent = `${s.queued} patient${s.queued !== 1 ? 's' : ''} queued`;
+      } else if (s.today_total > 0 && s.today_complete === s.today_total) {
+        el.classList.add('ss-complete');
+        text.textContent = `All ${s.today_total} downloaded`;
+      } else if (s.today_total > 0) {
+        el.classList.add('ss-idle');
+        text.textContent = `${s.today_complete} / ${s.today_total} downloaded`;
+      } else {
+        el.classList.add('ss-idle');
+        text.textContent = 'No patients today';
+      }
+    } catch { /* server unreachable */ }
+  }
+  updateSidebarStatus();
+  setInterval(updateSidebarStatus, 3000);
 </script>
 </body>
 </html>
