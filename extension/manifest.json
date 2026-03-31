@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PACS Clinic Preloader (DOM)",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Preload clinic X-rays — DOM-based UI automation (no GWT-RPC parsing)",
   "permissions": [
     "activeTab",

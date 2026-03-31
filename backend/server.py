@@ -94,6 +94,11 @@ _dirty_count = 0
 FLUSH_EVERY = 10            # write to disk every N images
 _last_image_at: float = 0.0  # epoch seconds of most recent image POST
 
+# ── Debug log ring buffer ──
+from collections import deque
+_debug_log: deque = deque(maxlen=500)  # keeps last 500 events
+_debug_seq = 0  # monotonic sequence number for polling
+
 def _get_cached_index() -> dict:
     global _index_cache
     if _index_cache is None:
@@ -513,16 +518,26 @@ def serve_image(patient_key: str, filename: str):
 
 
 @app.post("/api/patients/{patient_key}/request-refresh")
-def request_refresh(patient_key: str):
-    """Queue a refresh request for a patient."""
+async def request_refresh(patient_key: str, request: Request):
+    """Queue a refresh request for a patient. Body may include {"type": "full"|"auto"}."""
     global _dirty_count
     index = _get_cached_index()
     if patient_key not in index["patients"]:
         raise HTTPException(status_code=404, detail="Patient not found")
-    index["pending_refreshes"][patient_key] = datetime.utcnow().isoformat()
+    refresh_type = "auto"
+    try:
+        body = await request.json()
+        if body.get("type") in ("full", "auto"):
+            refresh_type = body["type"]
+    except Exception:
+        pass  # no body or invalid JSON → default to "auto"
+    index["pending_refreshes"][patient_key] = {
+        "type": refresh_type,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
     save_index(index)
     _dirty_count = 0
-    return {"status": "queued"}
+    return {"status": "queued", "type": refresh_type}
 
 
 @app.get("/api/pending_refreshes")
@@ -1328,6 +1343,228 @@ def get_feedback():
                 try: entries.append(json.loads(line))
                 except json.JSONDecodeError: pass
     return {"entries": entries}
+
+
+# ── Debug Log ──
+
+@app.post("/api/debug-log")
+async def post_debug_log(req: Request):
+    """Receive structured debug events from the extension."""
+    global _debug_seq
+    body = await req.json()
+    events = body if isinstance(body, list) else [body]
+    for evt in events:
+        _debug_seq += 1
+        evt["_seq"] = _debug_seq
+        evt["_server_time"] = datetime.now().isoformat()
+        _debug_log.append(evt)
+    return {"ok": True, "seq": _debug_seq}
+
+@app.get("/api/debug-log")
+def get_debug_log(since: int = 0):
+    """Return debug events since a given sequence number (for polling)."""
+    events = [e for e in _debug_log if e.get("_seq", 0) > since]
+    return {"events": events, "seq": _debug_seq}
+
+@app.delete("/api/debug-log")
+def clear_debug_log():
+    """Clear all debug log entries."""
+    global _debug_seq
+    _debug_log.clear()
+    _debug_seq = 0
+    return {"ok": True}
+
+@app.get("/debug", response_class=HTMLResponse)
+def debug_dashboard():
+    """Real-time debug dashboard for autorefresh diagnostics."""
+    return HTMLResponse("""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PACS Preloader — Debug Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Consolas', 'Fira Code', monospace; background: #0a0e17; color: #c8d0dc; font-size: 12px; }
+  .header { background: #111827; border-bottom: 1px solid #1e293b; padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 10; }
+  .header h1 { font-size: 14px; color: #38bdf8; font-weight: 600; }
+  .header .controls { display: flex; gap: 8px; align-items: center; }
+  .header button { background: #1e293b; border: 1px solid #334155; color: #94a3b8; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+  .header button:hover { background: #334155; color: #e2e8f0; }
+  .header .status { font-size: 11px; color: #64748b; }
+  .filter-bar { background: #111827; border-bottom: 1px solid #1e293b; padding: 6px 16px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .filter-btn { background: #1e293b; border: 1px solid #334155; color: #64748b; padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; }
+  .filter-btn.active { background: #0c4a6e; border-color: #0ea5e9; color: #38bdf8; }
+  #log { padding: 8px 16px; display: flex; flex-direction: column; gap: 1px; }
+  .event { padding: 4px 8px; border-radius: 3px; line-height: 1.5; border-left: 3px solid transparent; }
+  .event:hover { background: #111827; }
+  .event .time { color: #475569; margin-right: 8px; }
+  .event .source { color: #8b5cf6; margin-right: 6px; font-weight: 600; min-width: 80px; display: inline-block; }
+  .event .tag { display: inline-block; padding: 0 4px; border-radius: 2px; font-size: 10px; margin-right: 6px; font-weight: 600; }
+
+  /* Level colors */
+  .event.level-info { border-left-color: #334155; }
+  .event.level-filter { border-left-color: #0ea5e9; }
+  .event.level-pass { border-left-color: #22c55e; }
+  .event.level-reject { border-left-color: #ef4444; }
+  .event.level-warn { border-left-color: #f59e0b; }
+  .event.level-error { border-left-color: #ef4444; background: #1a0a0a; }
+  .event.level-start { border-left-color: #8b5cf6; background: #0f0a1a; }
+
+  .tag-info { background: #1e293b; color: #64748b; }
+  .tag-filter { background: #0c4a6e; color: #38bdf8; }
+  .tag-pass { background: #052e16; color: #4ade80; }
+  .tag-reject { background: #450a0a; color: #f87171; }
+  .tag-warn { background: #451a03; color: #fbbf24; }
+  .tag-error { background: #450a0a; color: #f87171; }
+  .tag-start { background: #1e1038; color: #a78bfa; }
+
+  .detail { color: #64748b; margin-left: 4px; }
+  .detail .key { color: #94a3b8; }
+  .detail .val { color: #e2e8f0; }
+  .detail .val-pass { color: #4ade80; }
+  .detail .val-fail { color: #f87171; }
+
+  .separator { border-top: 1px solid #1e293b; margin: 4px 0; }
+
+  .auto-scroll { position: fixed; bottom: 16px; right: 16px; background: #0ea5e9; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>PACS Debug Dashboard</h1>
+  <div class="controls">
+    <span class="status" id="status">Connecting...</span>
+    <button id="clearBtn">Clear</button>
+    <button id="pauseBtn">Pause</button>
+  </div>
+</div>
+<div class="filter-bar" id="filterBar">
+  <button class="filter-btn active" data-filter="all">All</button>
+  <button class="filter-btn active" data-filter="date-filter">Date Filter</button>
+  <button class="filter-btn active" data-filter="dob-check">DOB</button>
+  <button class="filter-btn active" data-filter="region-filter">Region</button>
+  <button class="filter-btn active" data-filter="modality-filter">Modality</button>
+  <button class="filter-btn active" data-filter="mri-detect">MRI Detect</button>
+  <button class="filter-btn active" data-filter="refresh">Refresh</button>
+  <button class="filter-btn active" data-filter="search">Search</button>
+</div>
+<div id="log"></div>
+<button class="auto-scroll" id="scrollBtn">↓ Auto-scroll</button>
+
+<script>
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+let lastSeq = 0;
+let paused = false;
+let autoScroll = true;
+let eventCount = 0;
+const activeFilters = new Set(['all','date-filter','dob-check','region-filter','modality-filter','mri-detect','refresh','search']);
+
+// Filter bar
+document.getElementById('filterBar').addEventListener('click', e => {
+  const btn = e.target.closest('.filter-btn');
+  if (!btn) return;
+  const f = btn.dataset.filter;
+  if (f === 'all') {
+    const turnOn = !btn.classList.contains('active');
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', turnOn));
+    if (turnOn) activeFilters.add('all'); else activeFilters.clear();
+    document.querySelectorAll('.filter-btn').forEach(b => {
+      if (turnOn) activeFilters.add(b.dataset.filter); else activeFilters.delete(b.dataset.filter);
+    });
+  } else {
+    btn.classList.toggle('active');
+    if (btn.classList.contains('active')) activeFilters.add(f); else activeFilters.delete(f);
+  }
+  applyVisibility();
+});
+
+function applyVisibility() {
+  const showAll = activeFilters.has('all');
+  document.querySelectorAll('.event').forEach(el => {
+    const cat = el.dataset.category || '';
+    el.style.display = (showAll || activeFilters.has(cat)) ? '' : 'none';
+  });
+}
+
+function renderEvent(evt) {
+  const div = document.createElement('div');
+  const level = evt.level || 'info';
+  const cat = evt.category || 'info';
+  div.className = `event level-${level}`;
+  div.dataset.category = cat;
+
+  const time = evt._server_time ? evt._server_time.split('T')[1].split('.')[0] : '';
+  const source = evt.source || 'system';
+
+  let detailHtml = '';
+  if (evt.details && typeof evt.details === 'object') {
+    for (const [k, v] of Object.entries(evt.details)) {
+      const cls = v === true || v === 'PASS' ? 'val-pass' : (v === false || v === 'FAIL' || v === 'REJECT') ? 'val-fail' : 'val';
+      const display = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      detailHtml += ` <span class="detail"><span class="key">${esc(k)}:</span> <span class="${cls}">${esc(display)}</span></span>`;
+    }
+  }
+
+  div.innerHTML = `<span class="time">${time}</span><span class="source">${esc(source)}</span><span class="tag tag-${level}">${esc(level.toUpperCase())}</span>${esc(evt.message || '')}${detailHtml}`;
+
+  if (!activeFilters.has('all') && !activeFilters.has(cat)) div.style.display = 'none';
+  return div;
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+async function poll() {
+  if (paused) return;
+  try {
+    const resp = await fetch(`/api/debug-log?since=${lastSeq}`);
+    const data = await resp.json();
+    if (data.events.length > 0) {
+      const frag = document.createDocumentFragment();
+      for (const evt of data.events) {
+        frag.appendChild(renderEvent(evt));
+        eventCount++;
+      }
+      logEl.appendChild(frag);
+      lastSeq = data.seq;
+      statusEl.textContent = `${eventCount} events | seq ${lastSeq}`;
+      if (autoScroll) window.scrollTo(0, document.body.scrollHeight);
+    }
+  } catch (e) {
+    statusEl.textContent = 'Connection error: ' + e.message;
+  }
+}
+
+setInterval(poll, 1000);
+poll();
+
+document.getElementById('clearBtn').addEventListener('click', async () => {
+  await fetch('/api/debug-log', { method: 'DELETE' });
+  logEl.innerHTML = '';
+  lastSeq = 0;
+  eventCount = 0;
+  statusEl.textContent = 'Cleared';
+});
+
+document.getElementById('pauseBtn').addEventListener('click', () => {
+  paused = !paused;
+  document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+});
+
+window.addEventListener('scroll', () => {
+  const atBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 50;
+  autoScroll = atBottom;
+  document.getElementById('scrollBtn').style.display = atBottom ? 'none' : 'block';
+});
+
+document.getElementById('scrollBtn').addEventListener('click', () => {
+  window.scrollTo(0, document.body.scrollHeight);
+  autoScroll = true;
+  document.getElementById('scrollBtn').style.display = 'none';
+});
+</script>
+</body>
+</html>""", headers={"Cache-Control": "no-store"})
 
 
 # ── Viewer ──

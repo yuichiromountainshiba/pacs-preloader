@@ -8,8 +8,88 @@ const refreshesInProgress = new Set();
 // Tracks patients whose pre-visit auto-refresh has already been queued this session
 const visitAutoQueued = new Set();
 
+// ── Debug logging helper ──
+const _debugQueue = [];
+let _debugFlushTimer = null;
+
+function debugLog(source, level, category, message, details = {}) {
+  console.log(`[DEBUG:${source}] ${message}`, details);
+  _debugQueue.push({ source, level, category, message, details, ts: new Date().toISOString() });
+  if (!_debugFlushTimer) {
+    _debugFlushTimer = setTimeout(flushDebugLog, 300);
+  }
+}
+
+async function flushDebugLog() {
+  _debugFlushTimer = null;
+  if (_debugQueue.length === 0) return;
+  const batch = _debugQueue.splice(0);
+  try {
+    const saved = await chrome.storage.local.get(['serverUrl']);
+    const serverUrl = (saved.serverUrl || 'http://localhost:8888').replace(/\/$/, '');
+    await fetch(`${serverUrl}/api/debug-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(batch),
+    });
+  } catch (e) { /* debug logging is best-effort */ }
+}
+
+// ── PACS tab ownership ──
+// Each extension variant (spine/hipknee) claims its own PACS tab(s) so they
+// don't fight over the same search box when running in parallel.
+const EXT_ID = chrome.runtime.id;  // unique per extension install
+
+async function claimPacsTab(tabId) {
+  const saved = await chrome.storage.local.get(['ownedPacsTabs']) || {};
+  const owned = saved.ownedPacsTabs || [];
+  if (!owned.includes(tabId)) owned.push(tabId);
+  await chrome.storage.local.set({ ownedPacsTabs: owned });
+}
+
+async function getOwnedTabIds() {
+  const saved = await chrome.storage.local.get(['ownedPacsTabs']);
+  return saved.ownedPacsTabs || [];
+}
+
+/**
+ * Recover a PACS tab that belongs to THIS extension.
+ * If this extension previously claimed a tab and it's still open, use it.
+ * If another extension owns all existing PACS tabs, open a new one.
+ */
+async function recoverOwnPacsTab() {
+  const allTabs = await chrome.tabs.query({}).catch(() => []);
+  const pacsTabs = allTabs.filter(t => t.url && t.url.includes('pacs.renoortho.com'));
+  if (!pacsTabs.length) return null;
+
+  // Check which tabs we previously claimed
+  const ownedIds = await getOwnedTabIds();
+  const ownedAlive = pacsTabs.filter(t => ownedIds.includes(t.id));
+
+  if (ownedAlive.length > 0) {
+    const tid = ownedAlive[0].id;
+    debugLog('refresh', 'info', 'refresh', `Using owned PACS tab ${tid}`, { subspecialty: typeof SUBSPECIALTY !== 'undefined' ? SUBSPECIALTY.id : 'unknown' });
+    return tid;
+  }
+
+  // No owned tabs alive — open a new dedicated tab for this extension
+  debugLog('refresh', 'info', 'refresh', 'No owned PACS tab found — opening dedicated tab', {
+    subspecialty: typeof SUBSPECIALTY !== 'undefined' ? SUBSPECIALTY.id : 'unknown',
+    existing_pacs_tabs: pacsTabs.map(t => t.id),
+  });
+  const tab = await chrome.tabs.create({ url: 'https://pacs.renoortho.com/InteleBrowser/app', active: false });
+  await waitForTabLoad(tab.id);
+  await sleep(1000);
+  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['config.js'] }).catch(() => {});
+  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => {});
+  await claimPacsTab(tab.id);
+  return tab.id;
+}
+
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[PACS Preloader] Extension installed');
+  console.log('[PACS Preloader] Extension installed — v2.1.0-debug');
+  // Clear stale tab ownership on install/update
+  chrome.storage.local.set({ ownedPacsTabs: [] });
   chrome.alarms.create('pollRefreshes', { periodInMinutes: 10 / 60 }); // every 10s
   chrome.alarms.create('checkVisitTimes', { periodInMinutes: 1 });    // every 1 min
   chrome.alarms.create('pollPreloads', { periodInMinutes: 30 / 60 }); // every 30s
@@ -52,6 +132,8 @@ async function runPreload({ patients, serverUrl, clinicDate, filters, tabId, tab
 
   const { tabIds, openedByUs } = await openPacsTabs(n, tabId);
   pacsTabId = tabIds[0]; // keep primary tab for auto-refresh recovery
+  // Claim all tabs for this extension so refreshes don't collide with other variants
+  for (const tid of tabIds) await claimPacsTab(tid);
   console.log(`[Preload] tabs: ${tabIds.join(', ')} | opened by us: ${openedByUs.join(', ') || 'none'}`);
 
   // Distribute patients round-robin across tabs
@@ -140,6 +222,13 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
   // clinic_date immediately, regardless of whether image uploads succeed later.
   await registerPatientPlaceholder(pt, serverUrl, clinicDate);
 
+  debugLog('preload', 'start', 'search', `Searching PACS for ${pt.name}`, {
+    dob: pt.dob,
+    todayOnly,
+    filters_modalities: filters?.modalities,
+    filters_regions: filters?.regions,
+  });
+
   const result = await sendToContentScriptTab(tabId || pacsTabId, 'searchPatient', {
     name: pt.name,
     dob: pt.dob,
@@ -148,13 +237,25 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
   });
 
   if (result.error) {
+    debugLog('preload', 'error', 'search', `Search error: ${pt.name}`, { error: result.error });
     postToPopup({ action: 'preloadLog', text: `  ✗ Search error: ${result.error}`, cls: 'error' });
     return 0;
   }
   if (!result.studies || result.studies.length === 0) {
+    debugLog('preload', 'warn', 'search', `No studies found: ${pt.name}`);
     postToPopup({ action: 'preloadLog', text: `  ✗ No studies found — adding to viewer for manual refresh`, cls: 'error' });
     return 0;
   }
+
+  debugLog('preload', 'pass', 'search', `Found ${result.studies.length} study(ies) for ${pt.name}`, {
+    studies: result.studies.map(s => ({
+      desc: s.description,
+      modality: s.modality,
+      date: s.studyDate,
+      dob: s.patientDob,
+      series_count: s.series?.length || 0,
+    })),
+  });
 
   postToPopup({ action: 'preloadLog', text: `  Found ${result.studies.length} study(ies)`, cls: 'success' });
   let count = 0;
@@ -162,6 +263,12 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
   // Log all studies upfront before parallel execution
   for (const study of result.studies) {
     if (!study.series || study.series.length === 0) {
+      debugLog('preload', 'warn', 'mri-detect', `Study "${study.description}" has NO series — possible MRI misclassification`, {
+        modality_field: study.modality,
+        description: study.description,
+        is_mri_by_mod: /^(MR|MRI)$/i.test(study.modality),
+        is_mri_by_desc: /^(MR|MRI)[\s\-]/i.test(study.description),
+      });
       postToPopup({ action: 'preloadLog', text: `  ${study.description || 'Unknown study'} — no series`, cls: 'error' });
     } else {
       postToPopup({ action: 'preloadLog', text: `  ${study.description || 'Unknown study'}`, cls: 'info' });
@@ -226,66 +333,111 @@ async function setPatientClinicTime(pt, serverUrl) {
 // ── Pending Refresh Poll ──
 async function pollPendingRefreshes() {
   if (isPreloading) return;
-  console.log('[Refresh] poll fired — pacsTabId:', pacsTabId);
 
   // Recover pacsTabId if service worker restarted (in-memory state lost)
   if (!pacsTabId) {
-    const allTabs = await chrome.tabs.query({}).catch(() => []);
-    console.log('[Refresh] all tabs:', allTabs.map(t => t.id + ' ' + t.url));
-    const pacsTabs = allTabs.filter(t => t.url && t.url.includes('pacs.renoortho.com'));
-    console.log('[Refresh] PACS tabs found:', pacsTabs.length);
-    if (!pacsTabs.length) { console.log('[Refresh] no PACS tab — aborting'); return; }
-    pacsTabId = pacsTabs[0].id;
-    console.log('[Refresh] recovered pacsTabId:', pacsTabId);
+    pacsTabId = await recoverOwnPacsTab();
+    if (!pacsTabId) return;
   }
 
   try {
     const saved = await chrome.storage.local.get(['serverUrl', 'clinicDate']);
     const serverUrl = (saved.serverUrl || 'http://localhost:8888').replace(/\/$/, '');
-    console.log('[Refresh] serverUrl:', serverUrl);
     const clinicDate = saved.clinicDate || '';
-    // Refreshes only fetch new X-rays — fast targeted lookup
     const baseFilters = await getFiltersFromStorage();
-    const filters = { ...baseFilters, modalities: ['xr'] };
 
     const resp = await fetch(`${serverUrl}/api/pending_refreshes`);
-    if (!resp.ok) { console.log('[Refresh] pending_refreshes returned', resp.status); return; }
+    if (!resp.ok) return;
     const data = await resp.json();
     const pendingKeys = Object.keys(data.pending || {});
-    console.log('[Refresh] pending keys:', pendingKeys);
+    if (pendingKeys.length === 0) return;
 
-    for (const [key] of Object.entries(data.pending || {})) {
-      if (refreshesInProgress.has(key)) { console.log('[Refresh] already in progress:', key); continue; }
+    debugLog('refresh', 'info', 'refresh', `Found ${pendingKeys.length} pending refresh(es)`, { keys: pendingKeys });
 
-      // Try in-memory list first; fall back to server lookup (handles service worker restart)
-      let patient = scheduledPatients.find(p => buildPatientKey(p) === key);
-      if (!patient) {
-        console.log('[Refresh] patient not in memory — fetching from server:', key);
-        try {
-          const pr = await fetch(`${serverUrl}/api/patients/${encodeURIComponent(key)}`);
-          console.log('[Refresh] patient fetch status:', pr.status);
-          if (!pr.ok) continue;
+    for (const [key, meta] of Object.entries(data.pending || {})) {
+      if (refreshesInProgress.has(key)) continue;
+
+      // Determine refresh type — supports both old (string timestamp) and new (object) format
+      const refreshType = (typeof meta === 'object' && meta.type) ? meta.type : 'auto';
+      const isFull = refreshType === 'full';
+
+      // Build filters based on refresh type
+      //   full:  all modalities, all dates, region filters from popup
+      //   auto:  XR only, today only, region filters from popup
+      const filters = isFull
+        ? { ...baseFilters, modalities: ['xr', 'ct', 'mr'] }
+        : { ...baseFilters, modalities: ['xr'] };
+      const todayOnly = !isFull;
+
+      // ── Name resolution: always check server first for viewer edits ──
+      let patient = null;
+      let nameSource = '';
+      const memoryPatient = scheduledPatients.find(p => buildPatientKey(p) === key);
+
+      debugLog('refresh', 'info', 'refresh', `Resolving name for "${key}" — checking server for latest (viewer may have edited it)`, {
+        in_memory_name: memoryPatient?.name || '(not in memory)',
+        refresh_type: refreshType,
+      });
+
+      try {
+        const pr = await fetch(`${serverUrl}/api/patients/${encodeURIComponent(key)}`);
+        if (pr.ok) {
           const pd = await pr.json();
           patient = { name: pd.name, dob: pd.dob, provider: pd.provider || '', clinic_date: pd.clinic_date || '' };
-          console.log('[Refresh] patient from server:', patient.name);
-        } catch (e) { console.log('[Refresh] patient fetch error:', e.message); continue; }
+          nameSource = 'server (latest from viewer)';
+
+          if (memoryPatient && memoryPatient.name !== pd.name) {
+            debugLog('refresh', 'warn', 'refresh', `Name was edited in viewer`, {
+              original_name: memoryPatient.name,
+              updated_name: pd.name,
+              using: 'updated name from server',
+            });
+          }
+        }
+      } catch (e) { /* fall through to in-memory */ }
+
+      // Fall back to in-memory list only if server lookup failed
+      if (!patient && memoryPatient) {
+        patient = memoryPatient;
+        nameSource = 'in-memory (server unreachable)';
+        debugLog('refresh', 'warn', 'refresh', `Server unreachable — using in-memory name`, {
+          name: patient.name,
+          warning: 'If name was edited in viewer, this may be stale',
+        });
+      }
+      if (!patient) {
+        debugLog('refresh', 'error', 'refresh', `Patient not found for key "${key}"`, {
+          checked_server: true,
+          checked_memory: true,
+        });
+        continue;
       }
 
       refreshesInProgress.add(key);
-      postToPopup({ action: 'preloadLog', text: `Auto-refreshing: ${patient.name}`, cls: 'info' });
-      console.log('[Refresh] starting preloadPatient for', patient.name);
+      const typeLabel = isFull ? 'FULL (all images, any date)' : 'AUTO (today XR only)';
+      debugLog('refresh', 'start', 'refresh', `${typeLabel} refresh for "${patient.name}"`, {
+        name_source: nameSource,
+        search_name: patient.name,
+        dob: patient.dob,
+        refresh_type: refreshType,
+        todayOnly,
+        modalities: filters.modalities,
+        regions: filters.regions,
+      });
+      postToPopup({ action: 'preloadLog', text: `${isFull ? 'Full' : 'Auto'}-refreshing: ${patient.name}`, cls: 'info' });
+
       try {
         const ptClinicDate = clinicDate || patient.clinic_date || '';
-        await preloadPatient(patient, serverUrl, ptClinicDate, filters, undefined, { todayOnly: true });
+        await preloadPatient(patient, serverUrl, ptClinicDate, filters, undefined, { todayOnly });
         await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' });
-        console.log('[Refresh] done + cleared pending for', patient.name);
+        debugLog('refresh', 'pass', 'refresh', `${typeLabel} refresh complete: ${patient.name}`);
       } catch (e) {
-        console.log('[Refresh] preloadPatient error:', e.message);
+        debugLog('refresh', 'error', 'refresh', `Refresh error: ${patient.name}`, { error: e.message });
         postToPopup({ action: 'preloadLog', text: `  ✗ Refresh error: ${e.message}`, cls: 'error' });
       }
       refreshesInProgress.delete(key);
     }
-  } catch (e) { console.log('[Refresh] outer error:', e.message); }
+  } catch (e) { debugLog('refresh', 'error', 'refresh', 'Poll outer error', { error: e.message }); }
 }
 
 async function getFiltersFromStorage() {
@@ -345,10 +497,8 @@ async function pollPendingPreloads() {
 
   // Need a PACS tab to search
   if (!pacsTabId) {
-    const allTabs = await chrome.tabs.query({}).catch(() => []);
-    const pacsTabs = allTabs.filter(t => t.url && t.url.includes('pacs.renoortho.com'));
-    if (!pacsTabs.length) return;
-    pacsTabId = pacsTabs[0].id;
+    pacsTabId = await recoverOwnPacsTab();
+    if (!pacsTabId) return;
   }
 
   try {

@@ -316,6 +316,23 @@
     }
     .patient-refresh-btn:hover { color: #64748b; }
     .patient-edit-btn:hover { color: #64748b; }
+    /* ── Refresh dropdown ── */
+    .refresh-wrap { position: relative; flex-shrink: 0; margin-top: 2px; }
+    .refresh-menu {
+      display: none; position: absolute; right: 0; top: 100%; z-index: 30;
+      background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4); min-width: 180px; padding: 4px 0;
+      margin-top: 2px;
+    }
+    .refresh-menu.open { display: block; }
+    .refresh-menu-item {
+      display: block; width: 100%; background: none; border: none; color: #e2e8f0;
+      padding: 7px 12px; font-size: 12px; text-align: left; cursor: pointer;
+      line-height: 1.3;
+    }
+    .refresh-menu-item:hover { background: #334155; }
+    .refresh-menu-item .rm-label { display: block; font-weight: 500; }
+    .refresh-menu-item .rm-desc { display: block; font-size: 10px; color: #64748b; margin-top: 1px; }
     .patient-item.refresh-pending .patient-name::after { content: ' ↻'; display: inline-block; animation: spin 1s linear infinite; }
     @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
     .refresh-pending-age { color: #f59e0b; font-size: 10px; }
@@ -907,7 +924,19 @@
               <span class="patient-badge">${p.image_count} image${p.image_count !== 1 ? 's' : ''} · ${p.study_count} study</span>
             </div>
             <button class="patient-edit-btn" title="Edit patient name" onclick="event.stopPropagation(); startEditPatientName('${escAttr(p.key)}', '${escAttr(p.name)}')">${editSvg}</button>
-            <button class="patient-refresh-btn" title="Request refresh" onclick="event.stopPropagation(); requestPatientRefresh('${escAttr(p.key)}')">${refreshSvg}</button>
+            <div class="refresh-wrap">
+              <button class="patient-refresh-btn" title="Refresh images" onclick="event.stopPropagation(); toggleRefreshMenu('${escAttr(p.key)}')">${refreshSvg}</button>
+              <div class="refresh-menu" id="rm-${escAttr(p.key)}">
+                <button class="refresh-menu-item" onclick="event.stopPropagation(); doRefresh('${escAttr(p.key)}','full')">
+                  <span class="rm-label">Full refresh</span>
+                  <span class="rm-desc">All images, any date, all modalities</span>
+                </button>
+                <button class="refresh-menu-item" onclick="event.stopPropagation(); doRefresh('${escAttr(p.key)}','auto')">
+                  <span class="rm-label">Today's XR only</span>
+                  <span class="rm-desc">New X-rays from today (pre-clinic)</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>`;
       }
@@ -927,14 +956,39 @@
     document.querySelector(`.date-group[data-date="${CSS.escape(dk)}"]`)?.classList.toggle('collapsed', collapsedDates.has(dk));
   }
 
-  async function requestPatientRefresh(key) {
+  function toggleRefreshMenu(key) {
+    // Close any other open menus
+    document.querySelectorAll('.refresh-menu.open').forEach(m => {
+      if (m.id !== 'rm-' + key) m.classList.remove('open');
+    });
+    const menu = document.getElementById('rm-' + key);
+    if (menu) menu.classList.toggle('open');
+  }
+
+  // Close refresh menus when clicking elsewhere
+  document.addEventListener('click', () => {
+    document.querySelectorAll('.refresh-menu.open').forEach(m => m.classList.remove('open'));
+  });
+
+  async function doRefresh(key, type) {
+    // Close menu
+    document.querySelectorAll('.refresh-menu.open').forEach(m => m.classList.remove('open'));
+    await requestPatientRefresh(key, type);
+  }
+
+  async function requestPatientRefresh(key, type = 'auto') {
     pendingRefreshKeys.set(key, Date.now());
     const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
     if (el) el.classList.add('refresh-pending');
+    const label = type === 'full' ? 'Full refresh' : "Today's XR refresh";
     try {
-      const resp = await fetch(`${API}/api/patients/${encodeURIComponent(key)}/request-refresh`, { method: 'POST' });
+      const resp = await fetch(`${API}/api/patients/${encodeURIComponent(key)}/request-refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type }),
+      });
       if (resp.ok) {
-        showToast('Refresh queued — extension will fetch when idle', 'info');
+        showToast(`${label} queued — extension will fetch when idle`, 'info');
       } else {
         showToast(`Refresh failed: server returned ${resp.status}`, 'error');
         pendingRefreshKeys.delete(key);
@@ -976,8 +1030,8 @@
         body: JSON.stringify({ name: newName }),
       });
       if (resp.ok) {
-        showToast(`Name updated — queuing refresh for "${newName}"`, 'info');
-        await requestPatientRefresh(key);
+        showToast(`Name updated — queuing full refresh for "${newName}"`, 'info');
+        await requestPatientRefresh(key, 'full');
       } else {
         showToast('Failed to update name', 'error');
       }
@@ -1077,7 +1131,12 @@
         exitCompareMode();
         document.getElementById('compareBtn').classList.remove('active');
       }
+      if (viewMode === 'snapshot') {
+        exitSnapshotMode();
+        document.getElementById('snapshotBtn').classList.remove('active');
+      }
       viewMode = 'single'; // reset so toggleSnapshotMode always enters snapshot
+      showSingleView();
 
       renderStudyBar();
       currentIndex = 0;
@@ -1743,10 +1802,12 @@
       i.rows != null &&
       Array.isArray(i.pixelSpacing)     && i.pixelSpacing.length >= 2
     );
+    console.log(`[REF-LINE] setupMriColumn: label="${labelText}" isSag=${isSag} isAx=${isAx} hasMetadata=${!!refImgMeta} imgCount=${images.length}`);
     if (refImgMeta) {
       const iop = refImgMeta.imageOrientation;
       const ipp = refImgMeta.imagePosition;
       const ps  = refImgMeta.pixelSpacing;
+      console.log(`[REF-LINE]   iop=[${iop.join(',')}] ipp=[${ipp.join(',')}] ps=[${ps.join(',')}] rows=${refImgMeta.rows} cols=${refImgMeta.cols}`);
       // Snap dominant direction cosines that may have been truncated by InteleBrowser
       // (e.g. '-0.9998...' stored as -0.9 → snap to -1).  Only affects |val| ≥ 0.85.
       const snap = v => (v != null && Math.abs(v) >= 0.85) ? Math.sign(v) : v;
@@ -1758,16 +1819,27 @@
         const cz      = snap(iop[5]);
         const z0      = ipp[2];
         const zExtent = (nRows - 1) * ps[0] * cz;
+        console.log(`[REF-LINE]   SAG: cz=${cz} z0=${z0} zExtent=${zExtent} valid=${Math.abs(zExtent) > 1}`);
         if (Math.abs(zExtent) > 1)
           physicalExtent = { z0, zExtent, iop: rawIop, ipp: rawIpp, rows: nRows, cols: nCols, ps };
       } else if (isAx) {
         const rx      = snap(iop[0]);
         const x0      = ipp[0];
         const xExtent = (nCols - 1) * ps[1] * rx;
+        console.log(`[REF-LINE]   AX: rx=${rx} x0=${x0} xExtent=${xExtent} valid=${Math.abs(xExtent) > 1}`);
         if (Math.abs(xExtent) > 1)
           physicalExtent = { x0, xExtent, iop: rawIop, ipp: rawIpp, rows: nRows, cols: nCols, ps };
+      } else {
+        console.log(`[REF-LINE]   SKIPPED: not sag or ax`);
+      }
+    } else {
+      console.log(`[REF-LINE]   NO metadata found in ${images.length} images. First img keys:`, images.length > 0 ? Object.keys(images[0]) : 'none');
+      if (images.length > 0) {
+        const i0 = images[0];
+        console.log(`[REF-LINE]   First img: imagePosition=${JSON.stringify(i0.imagePosition)} imageOrientation=${JSON.stringify(i0.imageOrientation)} rows=${i0.rows} pixelSpacing=${JSON.stringify(i0.pixelSpacing)}`);
       }
     }
+    console.log(`[REF-LINE]   physicalExtent=${physicalExtent ? JSON.stringify({z0: physicalExtent.z0, zExtent: physicalExtent.zExtent, x0: physicalExtent.x0, xExtent: physicalExtent.xExtent}) : 'null'} linkGroupId=${linkGroupId}`);
 
     // Register in link group
     const registration = {
@@ -1828,7 +1900,10 @@
     }
 
     function updateReferenceLines() {
-      if (!linkGroupId || images.length <= 1) return;
+      if (!linkGroupId || images.length <= 1) {
+        if (images.length <= 1) console.log(`[REF-LINE] updateRefLines SKIP: label="${labelText}" imgCount=${images.length}`);
+        return;
+      }
       const group = mriLinkGroups[linkGroupId];
       if (!group) return;
 
@@ -1837,14 +1912,16 @@
 
       for (const reg of group) {
         if (reg.colEl === colEl) continue;
+        const regLabel = reg.colEl?.querySelector?.('.mri-series-label-text')?.textContent || '?';
 
         if (isSag && reg.isAx && reg.physicalExtent) {
           // Use LPS X coordinate directly — avoids SliceLocation sign ambiguity
           const sagX = img.imagePosition?.[0];
-          if (sagX == null || !isFinite(sagX)) continue;
+          if (sagX == null || !isFinite(sagX)) { console.log(`[REF-LINE] sag→ax SKIP: no sagX for "${labelText}"→"${regLabel}"`); continue; }
           const { x0, xExtent } = reg.physicalExtent;
           const raw = (sagX - x0) / xExtent;
           const prop = (raw >= 0 && raw <= 1) ? raw : null;
+          console.log(`[REF-LINE] sag→ax: "${labelText}"[${currentIdx}]→"${regLabel}" sagX=${sagX} x0=${x0} xExtent=${xExtent} raw=${raw} prop=${prop}`);
           reg.setReferenceLine('v', prop);
         } else if (isAx && reg.isSag && reg.physicalExtent) {
           const axIpp = img.imagePosition;
@@ -1852,15 +1929,20 @@
           if (axIpp && axIop && reg.physicalExtent.iop) {
             // Compute the true intersection of this oblique axial plane with the sagittal image
             const diag = computeObliqueRefLine(axIpp, axIop, reg.physicalExtent);
+            console.log(`[REF-LINE] ax→sag: "${labelText}"[${currentIdx}]→"${regLabel}" axIpp=[${axIpp}] diag=${JSON.stringify(diag)}`);
             reg.setReferenceLine('d', diag);
           } else {
+            console.log(`[REF-LINE] ax→sag FALLBACK: "${labelText}"→"${regLabel}" axIpp=${JSON.stringify(axIpp)} axIop=${JSON.stringify(axIop)} sagIop=${!!reg.physicalExtent?.iop}`);
             // Fallback: simple horizontal line at Z position
             const axZ = axIpp?.[2];
             if (axZ == null || !isFinite(axZ)) continue;
             const { z0, zExtent } = reg.physicalExtent;
             const raw = (axZ - z0) / zExtent;
+            console.log(`[REF-LINE] ax→sag FALLBACK h-line: axZ=${axZ} z0=${z0} zExtent=${zExtent} raw=${raw}`);
             reg.setReferenceLine('h', (raw >= 0 && raw <= 1) ? raw : null);
           }
+        } else if (!reg.isSag && !reg.isAx) {
+          console.log(`[REF-LINE] SKIP: "${labelText}" → "${regLabel}" (neither sag nor ax target)`);
         }
       }
     }

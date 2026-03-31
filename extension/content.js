@@ -14,6 +14,34 @@
 
 console.log('[PACS-DOM] Content script loaded (DOM v2.0.0)');
 
+// ── Debug logging helper (sends to server dashboard) ──
+const _contentDebugQueue = [];
+let _contentDebugTimer = null;
+
+function debugLog(source, level, category, message, details = {}) {
+  console.log(`[DEBUG:${source}] ${message}`, details);
+  _contentDebugQueue.push({ source, level, category, message, details, ts: new Date().toISOString() });
+  if (!_contentDebugTimer) {
+    _contentDebugTimer = setTimeout(_flushContentDebug, 300);
+  }
+}
+
+async function _flushContentDebug() {
+  _contentDebugTimer = null;
+  if (_contentDebugQueue.length === 0) return;
+  const batch = _contentDebugQueue.splice(0);
+  try {
+    // Try to get serverUrl from storage, fall back to default
+    const saved = await chrome.storage.local.get(['serverUrl']).catch(() => ({}));
+    const serverUrl = (saved.serverUrl || 'http://localhost:8888').replace(/\/$/, '');
+    await fetch(`${serverUrl}/api/debug-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(batch),
+    });
+  } catch (e) { /* best-effort */ }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // UTILITIES
 // ══════════════════════════════════════════════════════════════════════
@@ -361,9 +389,19 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   if (todayOnly) {
     const dateSet = setDateFilterToday();
     log(`Date filter set to Today: ${dateSet}`);
+    debugLog('content', dateSet ? 'pass' : 'reject', 'date-filter', `Today date filter: ${dateSet ? 'CLICKED' : 'NOT FOUND'}`, {
+      patient: cleanName,
+      todayOnly: true,
+      radio_found: dateSet,
+    });
   } else {
     const dateSet = setDateFilterAllDates();
     log(`Date filter set to All Dates: ${dateSet}`);
+    debugLog('content', 'info', 'date-filter', `All Dates filter: ${dateSet ? 'CLICKED' : 'NOT FOUND'}`, {
+      patient: cleanName,
+      todayOnly: false,
+      radio_found: dateSet,
+    });
   }
   await sleep(100);
 
@@ -469,16 +507,34 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   let result = studies;
   if (dob && result.length > 0) {
     const dobNorm = normalizeDob(dob);
+    debugLog('content', 'filter', 'dob-check', `DOB check: expected=${dob} normalized=${dobNorm}`, {
+      patient: cleanName,
+      input_dob: dob,
+      normalized_dob: dobNorm,
+      study_dobs: result.map(s => ({ desc: s.description, raw_dob: s.patientDob, normalized: normalizeDob(s.patientDob) })),
+    });
     if (dobNorm) {
       const filtered = result.filter(s => normalizeDob(s.patientDob) === dobNorm);
       if (filtered.length > 0) {
         log(`DOB filter: ${result.length} → ${filtered.length}`);
+        debugLog('content', 'pass', 'dob-check', `DOB matched: ${result.length} → ${filtered.length}`, {
+          patient: cleanName,
+          expected: dobNorm,
+          matched: filtered.length,
+        });
         result = filtered;
       } else {
         log(`DOB filter matched nothing — rejecting all (wrong patient). Expected DOB: ${dobNorm}, found: ${[...new Set(result.map(s => s.patientDob))]}`);
+        debugLog('content', 'reject', 'dob-check', `DOB MISMATCH — rejecting ALL ${result.length} studies`, {
+          patient: cleanName,
+          expected: dobNorm,
+          found_dobs: [...new Set(result.map(s => `${s.patientDob} → ${normalizeDob(s.patientDob)}`))],
+        });
         result = [];
       }
     }
+  } else if (!dob) {
+    debugLog('content', 'warn', 'dob-check', `No DOB provided — skipping DOB filter`, { patient: cleanName });
   }
 
   // ── Reset date filter back to All Dates after a Today-only search ──
@@ -526,13 +582,30 @@ function filterStudies(studies, options = {}) {
   let filtered = studies;
 
   if (options.regions && options.regions.length > 0) {
+    const regionResults = [];
     filtered = filtered.filter(s => {
       const desc = (s.description || '').toLowerCase();
-      return options.regions.some(region =>
+      const matched = options.regions.some(region =>
         (REGION_KEYWORDS[region] || []).some(kw => desc.includes(kw))
       );
+      const matchedRegion = matched ? options.regions.find(region =>
+        (REGION_KEYWORDS[region] || []).some(kw => desc.includes(kw))
+      ) : null;
+      regionResults.push({
+        desc: s.description,
+        result: matched ? 'PASS' : 'REJECT',
+        matched_region: matchedRegion,
+      });
+      return matched;
     });
-    console.log(`[PACS-DOM] Region filter (${SUBSPECIALTY.id}): ${studies.length} → ${filtered.length}`);
+    debugLog('content', 'filter', 'region-filter', `Region filter (${SUBSPECIALTY.id}): ${studies.length} → ${filtered.length}`, {
+      active_regions: options.regions,
+      decisions: regionResults,
+    });
+  } else {
+    debugLog('content', 'warn', 'region-filter', 'Region filter DISABLED (no regions selected)', {
+      study_count: studies.length,
+    });
   }
 
   if (options.modalities && options.modalities.length > 0) {
@@ -540,14 +613,42 @@ function filterStudies(studies, options = {}) {
     if (allowedMods.length > 0) {
       const before = filtered.length;
       const KNOWN_MOD_RE = /^(XR|MRI|MR|CT|DX|US|RF|NM|PT|CR|DR|DS|SC|OT)[\s\-]/i;
+      const modResults = [];
       filtered = filtered.filter(s => {
         const desc = (s.description || '').trim();
-        if (allowedMods.some(mod => new RegExp(`^${mod}[\\s\\-]`, 'i').test(desc))) return true;
-        if (options.modalities.includes('xr') && !KNOWN_MOD_RE.test(desc)) return true;
+        const mod = (s.modality || '').trim();
+
+        // 1. Check the DOM modality column first (most reliable)
+        if (mod && allowedMods.some(am => am.toUpperCase() === mod.toUpperCase())) {
+          modResults.push({ desc: s.description, mod_column: mod, result: 'PASS', reason: 'modality column match' });
+          return true;
+        }
+
+        // 2. Check description prefix
+        if (allowedMods.some(am => new RegExp(`^${am}[\\s\\-]`, 'i').test(desc))) {
+          modResults.push({ desc: s.description, mod_column: mod, result: 'PASS', reason: 'description prefix match' });
+          return true;
+        }
+
+        // 3. Fallback: if XR enabled and description doesn't start with known modality, assume XR
+        if (options.modalities.includes('xr') && !KNOWN_MOD_RE.test(desc)) {
+          modResults.push({ desc: s.description, mod_column: mod, result: 'PASS', reason: 'assumed XR (no known modality prefix)' });
+          return true;
+        }
+
+        modResults.push({ desc: s.description, mod_column: mod, result: 'REJECT', reason: 'no modality match' });
         return false;
       });
-      console.log(`[PACS-DOM] Modality filter: ${before} → ${filtered.length}`);
+      debugLog('content', 'filter', 'modality-filter', `Modality filter: ${before} → ${filtered.length}`, {
+        allowed_modalities: options.modalities,
+        allowed_codes: allowedMods,
+        decisions: modResults,
+      });
     }
+  } else {
+    debugLog('content', 'warn', 'modality-filter', 'Modality filter DISABLED (no modalities selected)', {
+      study_count: filtered.length,
+    });
   }
 
   return filtered;
@@ -609,7 +710,17 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
   }
 
   // ── Step 1c: Fetch DICOM slice metadata in parallel for MRI/CT series ──
-  const isMriOrCt = modality ? /^(MR|MRI|CT)$/i.test(modality) : /^(MR|MRI|CT)[\s\-]/i.test(studyDescription);
+  const isMriByMod  = /^(MR|MRI|CT)$/i.test(modality || '');
+  const isMriByDesc = /^(MR|MRI|CT)[\s\-]/i.test(studyDescription || '');
+  const isMriOrCt = isMriByMod || isMriByDesc;
+  debugLog('content', isMriOrCt ? 'pass' : 'info', 'mri-detect', `MRI/CT detection: ${isMriOrCt ? 'YES' : 'NO'}`, {
+    study: studyDescription,
+    modality_field: modality || '(empty)',
+    by_modality_column: isMriByMod,
+    by_description_prefix: isMriByDesc,
+    result: isMriOrCt ? 'MRI/CT path (with DICOM metadata)' : 'XR path (no slice metadata)',
+    series_count: series.length,
+  });
   const metadataMap = {};  // imageUrl → { sliceLocation, imagePosition }
   if (isMriOrCt) {
     const allMetaFetches = [];
