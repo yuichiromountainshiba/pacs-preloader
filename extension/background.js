@@ -482,9 +482,10 @@ async function pollPendingRefreshes() {
       // Determine refresh type — supports both old (string timestamp) and new (object) format
       const refreshType = (typeof meta === 'object' && meta.type) ? meta.type : 'auto';
       const isFull = refreshType === 'full';
+      const isManualToday = refreshType === 'today';
 
-      // Auto-refreshes: skip if appointment time has already passed
-      if (!isFull && (await isAppointmentPast(key, serverUrl))) {
+      // Only expire auto-queued refreshes (not manual "today" or "full" from viewer)
+      if (!isFull && !isManualToday && (await isAppointmentPast(key, serverUrl))) {
         debugLog('refresh', 'info', 'refresh', `Auto-refresh expired (appointment passed): ${key}`);
         await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' }).catch(() => {});
         continue;

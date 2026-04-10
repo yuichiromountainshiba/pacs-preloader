@@ -561,7 +561,7 @@ async def request_refresh(patient_key: str, request: Request):
     refresh_type = "auto"
     try:
         body = await request.json()
-        if body.get("type") in ("full", "auto"):
+        if body.get("type") in ("full", "auto", "today"):
             refresh_type = body["type"]
     except Exception:
         pass  # no body or invalid JSON → default to "auto"
