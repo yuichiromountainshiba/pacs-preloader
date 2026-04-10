@@ -5,8 +5,10 @@ let isPreloading = false;
 let pacsTabId = null;
 let scheduledPatients = [];
 const refreshesInProgress = new Set();
-// Tracks patients whose pre-visit auto-refresh has already been queued this session
-const visitAutoQueued = new Set();
+let refreshPollRunning = false;
+let pacsLoginNotified = false;  // only notify once per session about login
+// Tracks which auto-refresh passes have fired per patient: key → Set of pass names
+const visitAutoQueued = new Map();
 
 // ── Debug logging helper ──
 const _debugQueue = [];
@@ -86,13 +88,32 @@ async function recoverOwnPacsTab() {
   return tab.id;
 }
 
+function ensureAlarms() {
+  chrome.alarms.create('pollRefreshes', { periodInMinutes: 0.5 });    // every 30s (MV3 min)
+  chrome.alarms.create('checkVisitTimes', { periodInMinutes: 1 });    // every 1 min
+  chrome.alarms.create('pollPreloads', { periodInMinutes: 0.5 });     // every 30s
+  console.log('[PACS Preloader] Alarms created/refreshed');
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[PACS Preloader] Extension installed — v2.1.0-debug');
-  // Clear stale tab ownership on install/update
   chrome.storage.local.set({ ownedPacsTabs: [] });
-  chrome.alarms.create('pollRefreshes', { periodInMinutes: 10 / 60 }); // every 10s
-  chrome.alarms.create('checkVisitTimes', { periodInMinutes: 1 });    // every 1 min
-  chrome.alarms.create('pollPreloads', { periodInMinutes: 30 / 60 }); // every 30s
+  ensureAlarms();
+});
+
+// Also create alarms on browser startup (onInstalled doesn't fire on restart)
+chrome.runtime.onStartup.addListener(() => {
+  console.log('[PACS Preloader] Browser started — ensuring alarms');
+  ensureAlarms();
+});
+
+// Safety net: if service worker wakes for any reason, verify alarms exist
+chrome.alarms.getAll(alarms => {
+  const names = alarms.map(a => a.name);
+  if (!names.includes('checkVisitTimes') || !names.includes('pollRefreshes')) {
+    console.log('[PACS Preloader] Missing alarms detected — recreating');
+    ensureAlarms();
+  }
 });
 
 chrome.alarms.onAlarm.addListener(alarm => {
@@ -128,6 +149,7 @@ async function runPreload({ patients, serverUrl, clinicDate, filters, tabId, tab
   scheduledPatients = patients;
 
   const n = Math.min(Math.max(1, tabConcurrency), 4);
+  const runStart = Date.now();
   postToPopup({ action: 'preloadLog', text: `Starting preload: ${patients.length} patient(s)${clinicDate ? ' — clinic ' + clinicDate : ''}${n > 1 ? ` · ${n} parallel tabs` : ''}`, cls: 'info' });
 
   const { tabIds, openedByUs } = await openPacsTabs(n, tabId);
@@ -146,13 +168,20 @@ async function runPreload({ patients, serverUrl, clinicDate, filters, tabId, tab
   await Promise.all(tabIds.map((tid, wi) =>
     (async () => {
       for (const { pt, globalIndex } of queues[wi]) {
+        // Activate the tab so Chrome doesn't throttle content script timers
+        try { await chrome.tabs.update(tid, { active: true }); } catch {}
         postToPopup({ action: 'preloadProgress', current: completedCount, total: patients.length, label: `Searching: ${pt.name}` });
         postToPopup({ action: 'preloadLog', text: `\n[${globalIndex + 1}/${patients.length}] ${pt.name} (DOB: ${pt.dob}) [tab ${tid}]`, cls: 'info' });
         console.log(`[Preload] tab ${tid} worker ${wi} → patient ${globalIndex + 1}/${patients.length}: ${pt.name}`);
         try {
-          totalImages += await preloadPatient(pt, serverUrl, clinicDate, filters, tid);
+          totalImages += await withTimeout(
+            preloadPatient(pt, serverUrl, clinicDate, filters, tid),
+            300000, // 5 min max per patient
+            `Preload timed out for ${pt.name}`,
+          );
         } catch (err) {
           postToPopup({ action: 'preloadLog', text: `  ✗ Error: ${err.message}`, cls: 'error' });
+          debugLog('preload', 'error', 'timeout', `Nightly preload failed: ${pt.name}`, { error: err.message });
         }
         if (pt.visitTime) await setPatientClinicTime(pt, serverUrl);
         completedCount++;
@@ -167,8 +196,20 @@ async function runPreload({ patients, serverUrl, clinicDate, filters, tabId, tab
     chrome.tabs.remove(tid).catch(() => {});
   }
 
+  const elapsed = Date.now() - runStart;
+  const mins = Math.floor(elapsed / 60000);
+  const secs = Math.floor((elapsed % 60000) / 1000);
+  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+  debugLog('preload', 'pass', 'summary', `Preload complete: ${totalImages} image(s) in ${timeStr}`, {
+    elapsed_ms: elapsed,
+    total_images: totalImages,
+    total_patients: patients.length,
+    tabs_used: n,
+  });
+
   postToPopup({ action: 'preloadProgress', current: patients.length, total: patients.length, label: 'Done!' });
-  postToPopup({ action: 'preloadLog', text: `\n✓ Preload complete! ${totalImages} total image(s) saved.`, cls: 'success' });
+  postToPopup({ action: 'preloadLog', text: `\n✓ Preload complete! ${totalImages} total image(s) saved in ${timeStr} (${patients.length} patients, ${n} tabs).`, cls: 'success' });
   postToPopup({ action: 'preloadDone' });
   isPreloading = false;
 }
@@ -217,12 +258,13 @@ async function waitForTabLoad(tabId, timeout = 20000) {
 
 
 // ── Per-patient preload ──
-async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { todayOnly = false } = {}) {
+async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { todayOnly = false, patientKey = '' } = {}) {
   // Always register first so the patient appears in the viewer with the correct
   // clinic_date immediately, regardless of whether image uploads succeed later.
-  await registerPatientPlaceholder(pt, serverUrl, clinicDate);
+  await registerPatientPlaceholder(pt, serverUrl, clinicDate, patientKey);
 
   debugLog('preload', 'start', 'search', `Searching PACS for ${pt.name}`, {
+    patient_key: patientKey || undefined,
     dob: pt.dob,
     todayOnly,
     filters_modalities: filters?.modalities,
@@ -237,17 +279,20 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
   });
 
   if (result.error) {
-    debugLog('preload', 'error', 'search', `Search error: ${pt.name}`, { error: result.error });
+    debugLog('preload', 'error', 'search', `Search error: ${pt.name}`, { patient_key: patientKey || undefined, error: result.error });
     postToPopup({ action: 'preloadLog', text: `  ✗ Search error: ${result.error}`, cls: 'error' });
+    if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'error', result.error);
     return 0;
   }
   if (!result.studies || result.studies.length === 0) {
-    debugLog('preload', 'warn', 'search', `No studies found: ${pt.name}`);
+    debugLog('preload', 'warn', 'search', `No studies found: ${pt.name}`, { patient_key: patientKey || undefined });
     postToPopup({ action: 'preloadLog', text: `  ✗ No studies found — adding to viewer for manual refresh`, cls: 'error' });
+    if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'no_results', 'No studies found in PACS');
     return 0;
   }
 
   debugLog('preload', 'pass', 'search', `Found ${result.studies.length} study(ies) for ${pt.name}`, {
+    patient_key: patientKey || undefined,
     studies: result.studies.map(s => ({
       desc: s.description,
       modality: s.modality,
@@ -264,6 +309,7 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
   for (const study of result.studies) {
     if (!study.series || study.series.length === 0) {
       debugLog('preload', 'warn', 'mri-detect', `Study "${study.description}" has NO series — possible MRI misclassification`, {
+        patient_key: patientKey || undefined,
         modality_field: study.modality,
         description: study.description,
         is_mri_by_mod: /^(MR|MRI)$/i.test(study.modality),
@@ -276,6 +322,7 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
   }
 
   const eligibleStudies = result.studies.filter(s => s.series && s.series.length > 0);
+  if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'downloading', `${eligibleStudies.length} study(ies) found — downloading images`);
   const sentResults = await Promise.all(
     eligibleStudies.map(study =>
       sendToContentScriptTab(tabId || pacsTabId, 'batchPreloadStudy', {
@@ -288,26 +335,50 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
         location:         study.location || '',
         serverUrl,
         clinicDate,
+        patientKey,
       }).catch(e => ({ error: e.message, count: 0 }))
     )
   );
 
+  const studyResults = [];
   for (const [i, sent] of sentResults.entries()) {
     const study = eligibleStudies[i];
     if (sent.error) {
       postToPopup({ action: 'preloadLog', text: `    ✗ ${study.description}: ${sent.error}`, cls: 'error' });
+      studyResults.push({ desc: study.description, modality: study.modality, date: study.studyDate, error: sent.error, images: 0 });
       continue;
     }
     if (sent.studyDate) postToPopup({ action: 'preloadLog', text: `    Study date: ${sent.studyDate}`, cls: 'info' });
     postToPopup({ action: 'preloadLog', text: `    ✓ ${sent.count} image(s) from ${study.series.length} series (${study.description})`, cls: 'success' });
+    studyResults.push({ desc: study.description, modality: study.modality, date: study.studyDate, series: study.series.length, images: sent.count || 0 });
     count += sent.count || 0;
   }
+
+  // Audit trail: post summary to server for per-patient log
+  const auditEntry = {
+    at: new Date().toISOString(),
+    todayOnly,
+    filters: { modalities: filters?.modalities, regions: filters?.regions },
+    studies_found: result.studies.length,
+    studies_downloaded: eligibleStudies.length,
+    total_images: count,
+    study_results: studyResults,
+    skipped_studies: result.studies
+      .filter(s => !s.series || s.series.length === 0)
+      .map(s => ({ desc: s.description, modality: s.modality, date: s.studyDate, reason: 'no series (possible MRI misclassification)' })),
+  };
+  const auditKey = patientKey || `${pt.name}_${pt.dob}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
+  fetch(`${serverUrl}/api/patients/${encodeURIComponent(auditKey)}/audit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(auditEntry),
+  }).catch(() => {});
 
   await fetch(`${serverUrl}/api/flush-index`, { method: 'POST' }).catch(() => {});
   return count;
 }
 
-async function registerPatientPlaceholder(pt, serverUrl, clinicDate) {
+async function registerPatientPlaceholder(pt, serverUrl, clinicDate, patientKey = '') {
   try {
     const form = new FormData();
     form.append('patient_name', pt.name);
@@ -315,6 +386,7 @@ async function registerPatientPlaceholder(pt, serverUrl, clinicDate) {
     form.append('clinic_date', clinicDate);
     form.append('clinic_time', pt.visitTime || '');
     form.append('provider', pt.provider || '');
+    if (patientKey) form.append('patient_key', patientKey);
     await fetch(`${serverUrl}/api/patients/register`, { method: 'POST', body: form });
   } catch (e) { /* non-critical */ }
 }
@@ -332,15 +404,19 @@ async function setPatientClinicTime(pt, serverUrl) {
 
 // ── Pending Refresh Poll ──
 async function pollPendingRefreshes() {
-  if (isPreloading) return;
-
-  // Recover pacsTabId if service worker restarted (in-memory state lost)
-  if (!pacsTabId) {
-    pacsTabId = await recoverOwnPacsTab();
-    if (!pacsTabId) return;
-  }
+  // Allow refreshes even while a bulk preload is running — they use the same
+  // PACS tab but are serialised via refreshesInProgress so they won't collide.
+  // Only skip if another refresh poll is already mid-flight.
+  if (refreshPollRunning) return;
+  refreshPollRunning = true;
 
   try {
+    // Recover pacsTabId if service worker restarted (in-memory state lost)
+    if (!pacsTabId) {
+      pacsTabId = await recoverOwnPacsTab();
+      if (!pacsTabId) return;
+    }
+
     const saved = await chrome.storage.local.get(['serverUrl', 'clinicDate']);
     const serverUrl = (saved.serverUrl || 'http://localhost:8888').replace(/\/$/, '');
     const clinicDate = saved.clinicDate || '';
@@ -354,12 +430,57 @@ async function pollPendingRefreshes() {
 
     debugLog('refresh', 'info', 'refresh', `Found ${pendingKeys.length} pending refresh(es)`, { keys: pendingKeys });
 
+    // ── Check PACS login before attempting any refreshes ──
+    let pacsLoggedIn = false;
+    try {
+      const ping = await withTimeout(
+        _sendTabMessage(pacsTabId, 'ping', {}),
+        5000, 'ping timeout',
+      );
+      pacsLoggedIn = !!(ping && ping.hasSession);
+    } catch { /* tab dead or unresponsive */ }
+
+    if (!pacsLoggedIn) {
+      debugLog('refresh', 'warn', 'refresh', 'PACS not logged in — skipping refreshes, will retry next poll', {
+        pending_count: pendingKeys.length,
+      });
+      if (!pacsLoginNotified) {
+        pacsLoginNotified = true;
+        chrome.notifications.create('pacs-login', {
+          type: 'basic',
+          iconUrl: 'icon128.png',
+          title: 'PACS Not Logged In',
+          message: `${pendingKeys.length} refresh(es) waiting — log into PACS to process them`,
+          priority: 2,
+        });
+      }
+
+      // Even though we can't refresh, expire any auto-refreshes past appointment time
+      for (const [key, meta] of Object.entries(data.pending || {})) {
+        const refreshType = (typeof meta === 'object' && meta.type) ? meta.type : 'auto';
+        if (refreshType === 'auto' && (await isAppointmentPast(key, serverUrl))) {
+          debugLog('refresh', 'info', 'refresh', `Auto-refresh expired (appointment passed): ${key}`);
+          await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' }).catch(() => {});
+        }
+      }
+      return;
+    }
+    // PACS is logged in — clear the notification flag so we re-notify if it logs out again
+    pacsLoginNotified = false;
+
     for (const [key, meta] of Object.entries(data.pending || {})) {
       if (refreshesInProgress.has(key)) continue;
 
       // Determine refresh type — supports both old (string timestamp) and new (object) format
       const refreshType = (typeof meta === 'object' && meta.type) ? meta.type : 'auto';
       const isFull = refreshType === 'full';
+
+      // Auto-refreshes: skip if appointment time has already passed
+      if (!isFull && (await isAppointmentPast(key, serverUrl))) {
+        debugLog('refresh', 'info', 'refresh', `Auto-refresh expired (appointment passed): ${key}`);
+        await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' }).catch(() => {});
+        continue;
+      }
 
       // Build filters based on refresh type
       //   full:  all modalities, all dates, region filters from popup
@@ -383,7 +504,7 @@ async function pollPendingRefreshes() {
         const pr = await fetch(`${serverUrl}/api/patients/${encodeURIComponent(key)}`);
         if (pr.ok) {
           const pd = await pr.json();
-          patient = { name: pd.name, dob: pd.dob, provider: pd.provider || '', clinic_date: pd.clinic_date || '' };
+          patient = { name: pd.name, dob: pd.dob, provider: pd.provider || '', clinic_date: pd.clinic_date || '', clinic_time: pd.clinic_time || '' };
           nameSource = 'server (latest from viewer)';
 
           if (memoryPatient && memoryPatient.name !== pd.name) {
@@ -410,10 +531,14 @@ async function pollPendingRefreshes() {
           checked_server: true,
           checked_memory: true,
         });
+        // Clear the stuck pending entry so the spinner stops
+        await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' }).catch(() => {});
         continue;
       }
 
       refreshesInProgress.add(key);
+      // Activate the PACS tab so Chrome doesn't throttle content script timers
+      try { await chrome.tabs.update(pacsTabId, { active: true }); } catch {}
       const typeLabel = isFull ? 'FULL (all images, any date)' : 'AUTO (today XR only)';
       debugLog('refresh', 'start', 'refresh', `${typeLabel} refresh for "${patient.name}"`, {
         name_source: nameSource,
@@ -425,24 +550,37 @@ async function pollPendingRefreshes() {
         regions: filters.regions,
       });
       postToPopup({ action: 'preloadLog', text: `${isFull ? 'Full' : 'Auto'}-refreshing: ${patient.name}`, cls: 'info' });
+      await updateRefreshStatus(serverUrl, key, 'searching', `Searching PACS for ${patient.name}`);
 
       try {
         const ptClinicDate = clinicDate || patient.clinic_date || '';
-        await preloadPatient(patient, serverUrl, ptClinicDate, filters, undefined, { todayOnly });
-        await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' });
+        // Wrap preloadPatient in a timeout so a hung content script can't block forever
+        await withTimeout(
+          preloadPatient(patient, serverUrl, ptClinicDate, filters, undefined, { todayOnly, patientKey: key }),
+          90000, // 90s max per patient refresh
+          `Refresh timed out for ${patient.name}`,
+        );
         debugLog('refresh', 'pass', 'refresh', `${typeLabel} refresh complete: ${patient.name}`);
       } catch (e) {
         debugLog('refresh', 'error', 'refresh', `Refresh error: ${patient.name}`, { error: e.message });
         postToPopup({ action: 'preloadLog', text: `  ✗ Refresh error: ${e.message}`, cls: 'error' });
       }
+      // Always clear server pending + local tracking so spinner stops
+      await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' }).catch(() => {});
       refreshesInProgress.delete(key);
     }
   } catch (e) { debugLog('refresh', 'error', 'refresh', 'Poll outer error', { error: e.message }); }
+  finally { refreshPollRunning = false; }
 }
 
 async function getFiltersFromStorage() {
   const saved = await chrome.storage.local.get(['lastFilters']);
-  return saved.lastFilters || { regions: null, modalities: ['xr', 'ct', 'mr'] };
+  const filters = saved.lastFilters || { modalities: ['xr', 'ct', 'mr'] };
+  // Always enforce region filters — never allow null/empty
+  if (!filters.regions || filters.regions.length === 0) {
+    filters.regions = ['lumbar', 'cervical', 'thoracic'];
+  }
+  return filters;
 }
 
 
@@ -488,6 +626,24 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function updateRefreshStatus(serverUrl, key, status, detail) {
+  return fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, detail }),
+  }).catch(() => {});
+}
+
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      val => { clearTimeout(timer); resolve(val); },
+      err => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 
 // ── Pending Preloads (from nightly loader / schedule import) ──
 // Polls for patients imported via /api/schedule/import and runs them through
@@ -513,8 +669,9 @@ async function pollPendingPreloads() {
 
     console.log(`[Preload] Found ${data.patients.length} pending patient(s) from schedule import`);
 
-    // Use full filters from storage — same as popup checkbox state
-    const filters = await getFiltersFromStorage();
+    // Nightly/schedule preloads always use all modalities to ensure MRIs aren't missed
+    const baseFilters = await getFiltersFromStorage();
+    const filters = { ...baseFilters, modalities: ['xr', 'ct', 'mr'] };
     const clinicDate = data.clinic_date || '';
 
     // Clear the queue immediately so we don't re-trigger on next poll
@@ -527,6 +684,7 @@ async function pollPendingPreloads() {
       clinicDate,
       filters,
       tabId: pacsTabId,
+      tabConcurrency: 3,
     });
   } catch (e) {
     console.log('[Preload] poll error:', e.message);
@@ -535,7 +693,12 @@ async function pollPendingPreloads() {
 
 
 // ── Pre-visit Auto-refresh ──
-// Queues a refresh for any patient whose clinic visit is within the next 5 minutes.
+// Queues a refresh at ~12 min and ~6 min before each patient's appointment.
+const REFRESH_PASSES = [
+  { name: 'early', minBefore: 13, maxBefore: 7 },  // fires ~12 min out (13–7 min window)
+  { name: 'near',  minBefore: 7,  maxBefore: 0 },   // fires ~6 min out  (7–0 min window)
+];
+
 async function checkVisitTimes() {
   const saved = await chrome.storage.local.get(['serverUrl']);
   const serverUrl = (saved.serverUrl || 'http://localhost:8888').replace(/\/$/, '');
@@ -543,32 +706,48 @@ async function checkVisitTimes() {
   let data;
   try {
     const resp = await fetch(`${serverUrl}/api/patients`);
-    if (!resp.ok) return;
+    if (!resp.ok) { debugLog('visittime', 'error', 'visit-check', `Server returned ${resp.status}`); return; }
     data = await resp.json();
-  } catch (e) { return; }
+  } catch (e) { debugLog('visittime', 'error', 'visit-check', `Cannot reach server: ${e.message}`); return; }
 
   const now = new Date();
   const todayStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
-  for (const p of (data.patients || [])) {
-    if (!p.clinic_time || visitAutoQueued.has(p.key)) continue;
+  const todayPatients = (data.patients || []).filter(p => p.clinic_time && p.clinic_date && normalizeToIso(p.clinic_date) === todayStr);
 
-    // Only auto-refresh for patients scheduled TODAY
-    if (!p.clinic_date || normalizeToIso(p.clinic_date) !== todayStr) continue;
-
+  let queued = 0;
+  for (const p of todayPatients) {
     const visitDate = parseClinicTime(p.clinic_time);
     if (!visitDate) continue;
 
     const diffMs = visitDate - now;
-    // Queue if visit is 0–6 minutes away (catches the 1-min poll window before the 5-min mark)
-    if (diffMs >= 0 && diffMs <= 6 * 60 * 1000) {
-      visitAutoQueued.add(p.key);
-      console.log(`[VisitTime] Auto-refresh for ${p.name} — visit at ${p.clinic_time}`);
-      postToPopup({ action: 'preloadLog', text: `Auto-refresh: ${p.name} visits at ${p.clinic_time}`, cls: 'info' });
-      try {
-        await fetch(`${serverUrl}/api/patients/${encodeURIComponent(p.key)}/request-refresh`, { method: 'POST' });
-      } catch (e) { console.error('[VisitTime] queue error:', e.message); }
+    const diffMin = Math.round(diffMs / 60000);
+    const firedPasses = visitAutoQueued.get(p.key) || new Set();
+
+    for (const pass of REFRESH_PASSES) {
+      if (firedPasses.has(pass.name)) continue;
+      if (diffMs >= pass.maxBefore * 60000 && diffMs <= pass.minBefore * 60000) {
+        firedPasses.add(pass.name);
+        visitAutoQueued.set(p.key, firedPasses);
+        queued++;
+        debugLog('visittime', 'pass', 'auto-queue', `Auto-refresh [${pass.name}] queued: ${p.name} — visit in ${diffMin}min at ${p.clinic_time}`, { key: p.key, pass: pass.name });
+        postToPopup({ action: 'preloadLog', text: `Auto-refresh (${pass.name}): ${p.name} visits at ${p.clinic_time}`, cls: 'info' });
+        try {
+          await fetch(`${serverUrl}/api/patients/${encodeURIComponent(p.key)}/request-refresh`, { method: 'POST' });
+        } catch (e) { debugLog('visittime', 'error', 'auto-queue', `Queue error: ${e.message}`, { key: p.key }); }
+      }
     }
   }
+
+  const allFired = [...visitAutoQueued.values()].reduce((n, s) => n + s.size, 0);
+  debugLog('visittime', 'info', 'visit-check', `Checked ${todayPatients.length} patients for today, ${queued} queued this cycle, ${allFired} total passes fired`, {
+    next_upcoming: todayPatients
+      .filter(p => {
+        const fired = visitAutoQueued.get(p.key);
+        return (!fired || fired.size < REFRESH_PASSES.length) && parseClinicTime(p.clinic_time) > now;
+      })
+      .slice(0, 3)
+      .map(p => ({ name: p.name, time: p.clinic_time, mins_away: Math.round((parseClinicTime(p.clinic_time) - now) / 60000) })),
+  });
 }
 
 /**
@@ -596,4 +775,20 @@ function parseClinicTime(timeStr) {
   const d = new Date();
   d.setHours(h, min, 0, 0);
   return d;
+}
+
+/**
+ * Check if a patient's appointment time has already passed.
+ * Returns true if the appointment was today and the time is in the past.
+ */
+async function isAppointmentPast(patientKey, serverUrl) {
+  try {
+    const pr = await fetch(`${serverUrl}/api/patients/${encodeURIComponent(patientKey)}`);
+    if (!pr.ok) return false;
+    const pd = await pr.json();
+    if (!pd.clinic_time) return false;
+    const visitDate = parseClinicTime(pd.clinic_time);
+    if (!visitDate) return false;
+    return visitDate < new Date();
+  } catch { return false; }
 }

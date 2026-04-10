@@ -686,7 +686,7 @@ async function pLimit(tasks, concurrency) {
  *
  * Called via the 'batchPreloadStudy' message from popup.js.
  */
-async function batchPreloadStudy({ studyUid, series, patient, studyDescription, studyDate, modality, location: studyLocation, serverUrl, clinicDate }) {
+async function batchPreloadStudy({ studyUid, series, patient, studyDescription, studyDate, modality, location: studyLocation, serverUrl, clinicDate, patientKey }) {
   let resolvedStudyDate = studyDate || '';
   let resolvedLocation  = studyLocation || '';
 
@@ -737,9 +737,21 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
   }
 
   // ── Step 2: Collect all image download tasks ──
+  const seriesExclusions = (typeof SUBSPECIALTY !== 'undefined' && SUBSPECIALTY.seriesExclusions) || [];
   const downloadTasks = [];
   for (const sr of seriesResults) {
     if (!sr || !sr.urls.length) continue;
+    // Skip series whose description matches a body-part exclusion (e.g. wrist in a scoliosis study)
+    if (seriesExclusions.length > 0 && sr.series.description) {
+      const serDesc = sr.series.description.toLowerCase();
+      const excluded = seriesExclusions.find(kw => serDesc.includes(kw));
+      if (excluded) {
+        debugLog('content', 'filter', 'series-exclude', `Series excluded: "${sr.series.description}" (matched "${excluded}")`, {
+          study: studyDescription, series: sr.series.description, keyword: excluded,
+        });
+        continue;
+      }
+    }
     const desc = studyDescription +
       (sr.series.description ? ' - ' + sr.series.description : '');
     const sDate = resolvedStudyDate || sr.studyDate;   // DOM date wins over HTML fallback
@@ -768,6 +780,7 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
           fd.append('image_index',       String(i));
           fd.append('clinic_date',       clinicDate || '');
           fd.append('image_uid',         imageUid);
+          if (patientKey) fd.append('patient_key', patientKey);
 
           const meta = metadataMap[url];
           if (meta?.sliceLocation != null && isFinite(meta.sliceLocation)) {

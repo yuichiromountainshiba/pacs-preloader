@@ -98,6 +98,7 @@ _last_image_at: float = 0.0  # epoch seconds of most recent image POST
 from collections import deque
 _debug_log: deque = deque(maxlen=500)  # keeps last 500 events
 _debug_seq = 0  # monotonic sequence number for polling
+DEBUG_LOG_FILE = DATA_DIR / "debug.log"  # persistent log file (JSONL)
 
 def _get_cached_index() -> dict:
     global _index_cache
@@ -250,11 +251,12 @@ async def register_patient(
     clinic_date: str = Form(""),
     clinic_time: str = Form(""),
     provider: str = Form(""),
+    patient_key: str = Form(""),
 ):
     """Register a patient with no images yet (placeholder for pending preload)."""
     global _dirty_count
     index = _get_cached_index()
-    patient_key = sanitize_filename(f"{patient_name}_{patient_dob}")
+    patient_key = patient_key.strip() or sanitize_filename(f"{patient_name}_{patient_dob}")
     if patient_key not in index["patients"]:
         index["patients"][patient_key] = {
             "name": patient_name,
@@ -307,6 +309,7 @@ async def receive_image(
     provider: str = Form(""),
     modality: str = Form(""),
     location: str = Form(""),
+    patient_key: str = Form(""),
 ):
     """Receive an image from the Chrome extension and store it locally."""
 
@@ -316,6 +319,7 @@ async def receive_image(
             image, patient_name, patient_dob, study_uid, study_description,
             study_date, image_index, clinic_date, clinic_time, image_uid, slice_location,
             image_position, image_orientation, rows, cols, pixel_spacing, provider, modality, location,
+            patient_key_override=patient_key.strip() if patient_key else "",
         )
 
 
@@ -323,13 +327,14 @@ async def _receive_image_locked(
     image, patient_name, patient_dob, study_uid, study_description,
     study_date, image_index, clinic_date, clinic_time, image_uid, slice_location,
     image_position, image_orientation, rows, cols, pixel_spacing, provider, modality="", location="",
+    patient_key_override="",
 ):
     global _dirty_count, _last_image_at
     import time
     _last_image_at = time.time()
     index = _get_cached_index()
-    # Create / update patient
-    patient_key = sanitize_filename(f"{patient_name}_{patient_dob}")
+    # Create / update patient — use override key when provided (e.g. refresh after name edit)
+    patient_key = patient_key_override or sanitize_filename(f"{patient_name}_{patient_dob}")
     patient_dir = IMAGES_DIR / patient_key
     patient_dir.mkdir(parents=True, exist_ok=True)
     if patient_key not in index["patients"]:
@@ -456,6 +461,7 @@ def list_patients():
             "provider": data.get("provider", ""),
             "image_count": data["image_count"],
             "study_count": len(data["studies"]),
+            "last_refresh": data.get("last_refresh"),
         })
     # Sort: primary = clinic_date descending, secondary = clinic_time ascending
     def _time_sort_key(t):
@@ -517,6 +523,34 @@ def serve_image(patient_key: str, filename: str):
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
+@app.post("/api/patients/{patient_key}/audit")
+async def post_patient_audit(patient_key: str, request: Request):
+    """Append a preload audit entry to the patient record. Keeps last 20 entries."""
+    body = await request.json()
+    index = _get_cached_index()
+    pt = index.get("patients", {}).get(patient_key)
+    if not pt:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    if "preload_log" not in pt:
+        pt["preload_log"] = []
+    pt["preload_log"].append(body)
+    # Keep only last 20 entries to avoid bloat
+    if len(pt["preload_log"]) > 20:
+        pt["preload_log"] = pt["preload_log"][-20:]
+    save_index(index)
+    return {"status": "ok", "entries": len(pt["preload_log"])}
+
+
+@app.get("/api/patients/{patient_key}/audit")
+def get_patient_audit(patient_key: str):
+    """Return the preload audit trail for a patient."""
+    index = _index_cache if _index_cache is not None else load_index()
+    pt = index.get("patients", {}).get(patient_key)
+    if not pt:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return {"patient_key": patient_key, "name": pt.get("name"), "preload_log": pt.get("preload_log", [])}
+
+
 @app.post("/api/patients/{patient_key}/request-refresh")
 async def request_refresh(patient_key: str, request: Request):
     """Queue a refresh request for a patient. Body may include {"type": "full"|"auto"}."""
@@ -547,12 +581,33 @@ def get_pending_refreshes():
     return {"pending": index.get("pending_refreshes", {})}
 
 
+@app.patch("/api/pending_refreshes/{patient_key}")
+async def update_refresh_status(patient_key: str, request: Request):
+    """Update the status of a pending refresh (e.g. 'searching', 'downloading')."""
+    body = await request.json()
+    index = _get_cached_index()
+    entry = index.get("pending_refreshes", {}).get(patient_key)
+    if entry and isinstance(entry, dict):
+        entry["status"] = body.get("status", entry.get("status", "queued"))
+        if "detail" in body:
+            entry["detail"] = body["detail"]
+    return {"status": "updated"}
+
+
 @app.delete("/api/pending_refreshes/{patient_key}")
 def clear_refresh(patient_key: str):
-    """Clear a fulfilled refresh request."""
+    """Clear a fulfilled refresh request and record completion time on the patient."""
     global _dirty_count
     index = _get_cached_index()
-    index.get("pending_refreshes", {}).pop(patient_key, None)
+    entry = index.get("pending_refreshes", {}).pop(patient_key, None)
+    # Store last refresh result on the patient record
+    pt = index.get("patients", {}).get(patient_key)
+    if pt and entry and isinstance(entry, dict):
+        pt["last_refresh"] = {
+            "at": datetime.now().strftime("%#I:%M %p"),
+            "status": entry.get("status", "completed"),
+            "detail": entry.get("detail", ""),
+        }
     save_index(index)
     _dirty_count = 0
     return {"status": "cleared"}
@@ -1358,6 +1413,13 @@ async def post_debug_log(req: Request):
         evt["_seq"] = _debug_seq
         evt["_server_time"] = datetime.now().isoformat()
         _debug_log.append(evt)
+    # Persist to disk (append JSONL)
+    try:
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+    except Exception:
+        pass
     return {"ok": True, "seq": _debug_seq}
 
 @app.get("/api/debug-log")
@@ -1366,12 +1428,42 @@ def get_debug_log(since: int = 0):
     events = [e for e in _debug_log if e.get("_seq", 0) > since]
     return {"events": events, "seq": _debug_seq}
 
+@app.get("/api/debug-log/file")
+def get_debug_log_file(patient: str = "", date: str = "", category: str = "", tail: int = 200):
+    """Read persistent debug log with optional filters. Returns last `tail` matching events."""
+    events = []
+    if DEBUG_LOG_FILE.exists():
+        with open(DEBUG_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except Exception:
+                    continue
+                if patient and patient.lower() not in json.dumps(evt.get("message", "")).lower() \
+                        and patient.lower() not in json.dumps(evt.get("details", {})).lower():
+                    continue
+                if date and not evt.get("_server_time", "").startswith(date):
+                    continue
+                if category and evt.get("category") != category:
+                    continue
+                events.append(evt)
+    return {"events": events[-tail:], "total_matching": len(events)}
+
 @app.delete("/api/debug-log")
 def clear_debug_log():
-    """Clear all debug log entries."""
+    """Clear all debug log entries (memory + file)."""
     global _debug_seq
     _debug_log.clear()
     _debug_seq = 0
+    # Also truncate persistent log
+    try:
+        with open(DEBUG_LOG_FILE, "w", encoding="utf-8") as f:
+            pass
+    except Exception:
+        pass
     return {"ok": True}
 
 @app.get("/debug", response_class=HTMLResponse)

@@ -9,7 +9,8 @@
     "scripting",
     "storage",
     "cookies",
-    "alarms"
+    "alarms",
+    "notifications"
   ],
   "host_permissions": [
     "https://pacs.renoortho.com/*",

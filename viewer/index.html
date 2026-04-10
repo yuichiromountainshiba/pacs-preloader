@@ -336,11 +336,43 @@
     .patient-item.refresh-pending .patient-name::after { content: ' ↻'; display: inline-block; animation: spin 1s linear infinite; }
     @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
     .refresh-pending-age { color: #f59e0b; font-size: 10px; }
+    .refresh-status { font-size: 10px; margin-left: 4px; }
+    .refresh-status.status-queued { color: #94a3b8; }
+    .refresh-status.status-searching { color: #38bdf8; }
+    .refresh-status.status-downloading { color: #22c55e; }
+    .refresh-status.status-no_results { color: #f59e0b; }
+    .refresh-status.status-error { color: #ef4444; }
     .patient-name-input {
       background: #0f172a; border: 1px solid #3b82f6; border-radius: 4px;
       color: #f1f5f9; font-size: 15px; font-weight: 500; padding: 1px 5px;
       width: 100%; box-sizing: border-box; outline: none;
     }
+    /* ── Edit Name Modal ── */
+    .name-edit-overlay {
+      position: fixed; inset: 0; z-index: 9998;
+      background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center;
+    }
+    .name-edit-dialog {
+      background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+      padding: 20px 24px; width: 340px; max-width: 90vw;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+    .name-edit-dialog h3 { font-size: 15px; font-weight: 600; color: #94a3b8; margin-bottom: 12px; }
+    .name-edit-dialog input {
+      width: 100%; background: #0f172a; border: 1px solid #3b82f6; border-radius: 6px;
+      color: #f1f5f9; font-size: 16px; padding: 8px 10px; outline: none; box-sizing: border-box;
+    }
+    .name-edit-dialog input:focus { border-color: #60a5fa; box-shadow: 0 0 0 2px rgba(59,130,246,0.3); }
+    .name-edit-hint { font-size: 11px; color: #64748b; margin-top: 6px; }
+    .name-edit-btns { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
+    .name-edit-btns button {
+      padding: 7px 16px; border-radius: 6px; font-size: 13px; font-weight: 500;
+      border: 1px solid #334155; cursor: pointer;
+    }
+    .name-edit-cancel { background: #334155; color: #cbd5e1; }
+    .name-edit-cancel:hover { background: #475569; }
+    .name-edit-save { background: #2563eb; color: white; border-color: #2563eb; }
+    .name-edit-save:hover { background: #3b82f6; }
     .patient-visit-time { font-size: 10px; color: #38bdf8; margin-left: 4px; }
 
     /* Toast notifications */
@@ -462,8 +494,8 @@
       list-style: none; margin: 0; min-width: 140px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.6);
     }
-    /* In compare halves, label is at the bottom — open menu upward */
-    .compare-images-half .mri-series-label .series-swap-menu {
+    /* Label is at the bottom of columns — open menu upward */
+    .series-swap-menu {
       top: auto; bottom: 100%;
     }
     .series-swap-menu li {
@@ -726,6 +758,8 @@
 
   // Per-patient refresh tracking: key → timestamp (ms) when refresh was requested
   const pendingRefreshKeys = new Map();
+  // Per-patient refresh status: key → { status, detail }
+  const pendingRefreshStatus = new Map();
 
   // Date group collapse state (persists across renderPatientList re-renders)
   const collapsedDates = new Set();
@@ -808,13 +842,15 @@
         fetch(`${API}/api/pending_refreshes`),
       ]);
       const data = await patientsResp.json();
-      const serverPending = new Set(
-        Object.keys((pendingResp.ok ? await pendingResp.json() : { pending: {} }).pending || {})
-      );
+      const pendingData = (pendingResp.ok ? await pendingResp.json() : { pending: {} }).pending || {};
+      const serverPending = new Set(Object.keys(pendingData));
 
-      // Add any server-pending keys we don't know about (e.g. viewer opened mid-refresh)
-      for (const key of serverPending) {
+      // Track pending keys + their status from server
+      for (const [key, meta] of Object.entries(pendingData)) {
         if (!pendingRefreshKeys.has(key)) pendingRefreshKeys.set(key, Date.now());
+        const status = (typeof meta === 'object' && meta.status) ? meta.status : 'queued';
+        const detail = (typeof meta === 'object' && meta.detail) ? meta.detail : '';
+        pendingRefreshStatus.set(key, { status, detail });
       }
 
       // Keys the extension has finished: clear spinner + show result + reload if open
@@ -823,6 +859,7 @@
           const prevEl = document.querySelector(`[data-key="${CSS.escape(p.key)}"] .patient-badge`);
           const prevCount = prevEl ? parseInt(prevEl.textContent) : -1;
           pendingRefreshKeys.delete(p.key);
+          pendingRefreshStatus.delete(p.key);
           if (p.image_count > prevCount) {
             showToast(`✓ ${p.name} refreshed — ${p.image_count} image${p.image_count !== 1 ? 's' : ''} now`, 'success');
           } else {
@@ -886,10 +923,11 @@
     }
     const sortedKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a));
 
-    // Auto-collapse past dates on first load (only if they haven't been manually toggled)
-    const todayIso = new Date().toISOString().slice(0, 10);
+    // Auto-collapse all date groups except the newest on first load (only if they haven't been manually toggled)
+    // sortedKeys is descending, so the first key with an actual date is the newest
+    const newestDateKey = sortedKeys.find(dk => dk !== '') || sortedKeys[0] || '';
     for (const dk of sortedKeys) {
-      if (dk && dk < todayIso && !collapsedDates.has(dk) && !collapsedDates.has('__expanded_' + dk)) {
+      if (dk !== newestDateKey && !collapsedDates.has(dk) && !collapsedDates.has('__expanded_' + dk)) {
         collapsedDates.add(dk);
       }
     }
@@ -914,12 +952,19 @@
       for (const p of pts) {
         const isPending = pendingRefreshKeys.has(p.key);
         const pendingAge = isPending ? formatRefreshAge(pendingRefreshKeys.get(p.key)) : '';
+        const refreshInfo = pendingRefreshStatus.get(p.key);
+        const statusLabel = refreshInfo ? formatRefreshStatusLabel(refreshInfo.status, refreshInfo.detail) : '';
+        const statusClass = refreshInfo ? `status-${refreshInfo.status}` : '';
+        const lastRefresh = !isPending && p.last_refresh ? p.last_refresh : null;
+        const lastRefreshHtml = lastRefresh
+          ? ` · <span class="refresh-status status-${lastRefresh.status === 'downloading' ? 'done' : (lastRefresh.status || 'done')}">${formatLastRefresh(lastRefresh)}</span>`
+          : '';
         const visitTimeStr = p.clinic_time ? `<span class="patient-visit-time">· ${escHtml(p.clinic_time)}</span>` : '';
         html += `<div class="patient-item${isPending ? ' refresh-pending' : ''}" data-key="${escAttr(p.key)}" onclick="selectPatient('${escAttr(p.key)}')">
           <div class="patient-item-inner">
             <div class="patient-item-content">
               <div class="patient-name">${escHtml(p.name)}${visitTimeStr}</div>
-              <div class="patient-meta">DOB: ${escHtml(p.dob)}${pendingAge ? ` · <span class="refresh-pending-age">↻ ${escHtml(pendingAge)}</span>` : ''}</div>
+              <div class="patient-meta">DOB: ${escHtml(p.dob)}${isPending ? ` · <span class="refresh-status ${statusClass}">${statusLabel || '↻ ' + escHtml(pendingAge)}</span>` : escHtml('')}${lastRefreshHtml}</div>
               ${p.provider ? `<div class="patient-provider">${escHtml(p.provider)}</div>` : ''}
               <span class="patient-badge">${p.image_count} image${p.image_count !== 1 ? 's' : ''} · ${p.study_count} study</span>
             </div>
@@ -1001,21 +1046,39 @@
     }
   }
 
-  // ── Edit Patient Name ──
+  // ── Edit Patient Name (modal) ──
   function startEditPatientName(key, currentName) {
-    const nameEl = document.querySelector(`[data-key="${CSS.escape(key)}"] .patient-name`);
-    if (!nameEl) return;
-    const input = document.createElement('input');
-    input.className = 'patient-name-input';
-    input.value = currentName;
-    input.onclick = e => e.stopPropagation();
-    let saved = false;
-    input.onkeydown = e => {
-      if (e.key === 'Enter') { saved = true; savePatientName(key, input.value); }
-      if (e.key === 'Escape') loadPatients();
+    // Close any existing edit dialog
+    document.querySelector('.name-edit-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'name-edit-overlay';
+    overlay.innerHTML = `
+      <div class="name-edit-dialog">
+        <h3>Edit Patient Name</h3>
+        <input type="text" class="name-edit-input" value="${escAttr(currentName)}">
+        <div class="name-edit-hint">Change to match the name in radiology records, then save to trigger a full refresh.</div>
+        <div class="name-edit-btns">
+          <button class="name-edit-cancel">Cancel</button>
+          <button class="name-edit-save">Save &amp; Refresh</button>
+        </div>
+      </div>`;
+
+    const input = overlay.querySelector('.name-edit-input');
+    const closeDialog = () => overlay.remove();
+
+    overlay.querySelector('.name-edit-cancel').onclick = closeDialog;
+    overlay.querySelector('.name-edit-save').onclick = () => {
+      closeDialog();
+      savePatientName(key, input.value);
     };
-    input.onblur = () => { if (!saved) savePatientName(key, input.value); };
-    nameEl.replaceWith(input);
+    input.onkeydown = e => {
+      if (e.key === 'Enter') { closeDialog(); savePatientName(key, input.value); }
+      if (e.key === 'Escape') closeDialog();
+    };
+    overlay.onclick = e => { if (e.target === overlay) closeDialog(); };
+
+    document.body.appendChild(overlay);
     input.focus();
     input.select();
   }
@@ -1058,6 +1121,28 @@
     return `pending ${min}m ago`;
   }
 
+  function formatRefreshStatusLabel(status, detail) {
+    switch (status) {
+      case 'queued':      return '↻ Waiting in queue';
+      case 'searching':   return '↻ Searching PACS...';
+      case 'downloading': return '↻ Downloading images...';
+      case 'no_results':  return '⚠ No images found';
+      case 'error':       return '✗ Error: ' + (detail || 'unknown');
+      default:            return '↻ ' + (status || 'pending');
+    }
+  }
+
+  function formatLastRefresh(lr) {
+    const time = lr.at || '';
+    if (lr.status === 'downloading' || lr.status === 'completed' || !lr.status) {
+      const count = lr.detail || '';
+      return count ? `✓ Downloaded ${count} at ${time}` : `✓ Last checked ${time}`;
+    }
+    if (lr.status === 'no_results') return `⚠ No images found at ${time}`;
+    if (lr.status === 'error') return `✗ Error at ${time}`;
+    return `✓ Last checked ${time}`;
+  }
+
   // ── Select Patient ──
   async function selectPatient(key) {
     activeStudyKey = null;
@@ -1073,12 +1158,27 @@
       allImages  = [];
       allStudies = [];
 
+      // Merge studies with the same base description + date (PACS sometimes splits one exam into multiple Study UIDs)
+      const mergedStudies = {};
       for (const [studyKey, study] of Object.entries(data.studies)) {
         const desc = study.description || studyKey;
+        const baseDesc = desc.split(' - ')[0].trim();
+        const mergeKey = `${baseDesc}||${study.date || ''}`;
+        if (!mergedStudies[mergeKey]) {
+          mergedStudies[mergeKey] = { description: desc, date: study.date || '', key: studyKey, modality: study.modality || '', location: study.location || '', images: [...(study.images || [])] };
+        } else {
+          // Append images from duplicate study
+          mergedStudies[mergeKey].images.push(...(study.images || []));
+        }
+      }
+
+      for (const [, study] of Object.entries(mergedStudies)) {
+        const desc = study.description;
         const mod  = study.modality || '';
-        allStudies.push({ description: desc, date: study.date || '', key: studyKey, modality: mod, location: study.location || '' });
-        const isMri = isMriStudy(desc, mod);
-        const isCt  = isCtStudy(desc, mod);
+        const studyKey = study.key;
+        allStudies.push({ description: desc, date: study.date, key: studyKey, modality: mod, location: study.location });
+        const isMri = isMriStudy(desc, mod, study.images);
+        const isCt  = !isMri && isCtStudy(desc, mod);
         const sortedImages = [...(study.images || [])].sort((a, b) => {
           if (isMri || isCt) {
             const pa = parseSeriesFromFilename(a.filename), pb = parseSeriesFromFilename(b.filename);
@@ -1119,6 +1219,9 @@
           allImages.push(entry);
         }
       }
+
+      // Sort studies most-recent first (date is YYYYMMDD)
+      allStudies.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
       document.getElementById('viewerPatientName').textContent = data.name;
       document.getElementById('welcome').style.display   = 'none';
@@ -1192,10 +1295,26 @@
     return 2;
   }
 
-  // MRI: study description starts with MR/MRI
-  function isMriStudy(studyDescription, modality) {
-    if (modality) return /^MRI?$/i.test(modality);
-    return /^(MR|MRI)[\s\-]/i.test(studyDescription || '');
+  // MRI: study description starts with MR/MRI, or contains known MRI sequence terms,
+  // or images have MRI-like series names (SAG/AX/COR + T1/T2/PD/STIR/FS/GRE/MEDIC)
+  function isMriStudy(studyDescription, modality, images) {
+    if (/^MRI?$/i.test(modality || '')) return true;
+    const d = studyDescription || '';
+    if (/^(MR|MRI)[\s\-]/i.test(d)) return true;
+    // Catch studies named by sequence (e.g. "CSP AX GRE", "LSP SAG T2 STIR")
+    if (/\b(MEDIC|GRE|STIR|T2\b|T1\b)/i.test(d) && /\b(SAG|AX|COR)\b/i.test(d)) return true;
+    // Check series names from filenames — PACS sometimes miscatalogs MRIs as DX/XA
+    if (images && images.length > 10) {
+      const seriesLabels = new Set();
+      for (const img of images) {
+        const parsed = parseSeriesFromFilename(img.filename);
+        if (parsed) seriesLabels.add(parsed.seriesLabel.toLowerCase());
+      }
+      const hasMriOrientation = [...seriesLabels].some(s => /\b(sag|ax|cor|tra)\b/.test(s));
+      const hasMriSequence = [...seriesLabels].some(s => /\b(t1|t2|pd|stir|fs|gre|medic|flair)\b/.test(s));
+      if (hasMriOrientation && hasMriSequence) return true;
+    }
+    return false;
   }
 
   // CT: study description starts with CT
@@ -1224,7 +1343,7 @@
   // CT series order: 0 Axial, 1 Sagittal, 2 Coronal, 9 other
   function getCtSeriesOrder(seriesLabel) {
     const L = (seriesLabel || '').toLowerCase();
-    if (/\bax\b|axial/.test(L)) return 0;
+    if (/\bax\b|\btra\b|axial/.test(L)) return 0;
     if (/\bsag\b|sagittal/.test(L)) return 1;
     if (/\bcor\b|coronal/.test(L)) return 2;
     return 9;
@@ -1234,7 +1353,7 @@
   function getMriSeriesOrder(seriesLabel) {
     const L = (seriesLabel || '').toLowerCase().replace(/[^\w\s]/g, '');
     const hasSag  = /\bsag\b/.test(L);
-    const hasAx   = /\bax\b/.test(L) || /axial/.test(L);
+    const hasAx   = /\bax\b|\btra\b/.test(L) || /axial/.test(L);
     const hasT2   = /\bt2\b/.test(L);
     const hasStir = /\bstir\b/.test(L);
     const hasT1   = /\bt1\b/.test(L);
@@ -1436,12 +1555,12 @@
           wanted.map(ser => {
             const mid = ser.middleIndex;
             return `<div class="mri-series-column">
+              <div class="mri-stack-frame">
+                <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+              </div>
               <div class="mri-series-label">
                 <span class="mri-series-label-text">${escHtml(ser.seriesLabel)}</span>
                 <span class="mri-slice-counter">${mid + 1}/${ser.images.length}</span>
-              </div>
-              <div class="mri-stack-frame">
-                <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
               </div>
             </div>`;
           }).join('')
@@ -1647,12 +1766,12 @@
     grid.innerHTML = page.map(ser => {
       const mid = ser.middleIndex;
       return `<div class="mri-series-column">
+        <div class="mri-stack-frame">
+          <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+        </div>
         <div class="mri-series-label">
           <span class="mri-series-label-text">${escHtml(ser.seriesLabel)}</span>
           <span class="mri-slice-counter">${mid + 1}/${ser.images.length}</span>
-        </div>
-        <div class="mri-stack-frame">
-          <img class="mri-stack-img" src="${escHtml(ser.images[mid].url)}" alt="${mid + 1}" loading="lazy">
         </div>
       </div>`;
     }).join('');
@@ -1675,12 +1794,12 @@
 
   function swapSeriesInColumn(colEl, newSeries, seriesList, linkGroupId) {
     const mid = newSeries.scrollToIndex ?? newSeries.middleIndex;
-    colEl.innerHTML = `<div class="mri-series-label">
+    colEl.innerHTML = `<div class="mri-stack-frame">
+        <img class="mri-stack-img" src="${escHtml(newSeries.images[mid].url)}" alt="${mid + 1}" loading="lazy">
+      </div>
+      <div class="mri-series-label">
         <span class="mri-series-label-text">${escHtml(newSeries.seriesLabel)}</span>
         <span class="mri-slice-counter">${mid + 1}/${newSeries.images.length}</span>
-      </div>
-      <div class="mri-stack-frame">
-        <img class="mri-stack-img" src="${escHtml(newSeries.images[mid].url)}" alt="${mid + 1}" loading="lazy">
       </div>`;
     // Remove old registration (setupMriColumn will also do this via _mriCleanup, belt+suspenders)
     if (linkGroupId && mriLinkGroups[linkGroupId]) {
@@ -1789,7 +1908,7 @@
     // Detect orientation from label text
     const labelText = labelTextEl ? labelTextEl.textContent : '';
     const isSag = /\bsag\b/i.test(labelText);
-    const isAx  = /\bax/i.test(labelText);
+    const isAx  = /\bax|tra\b/i.test(labelText);
 
     // Compute physical image extent for accurate cross-reference line placement.
     // SAG: the line on SAG from an AX slice must land at the correct fraction of SAG's
@@ -1816,7 +1935,15 @@
       const nRows   = refImgMeta.rows;
       const nCols   = refImgMeta.cols ?? refImgMeta.rows;
       if (isSag) {
-        const cz      = snap(iop[5]);
+        let cz = snap(iop[5]);
+        // InteleBrowser sometimes truncates iop[5] to 0 for sagittal images.
+        // For a true sagittal, the column direction is cranio-caudal (Z ≈ ±1).
+        // Infer sign from the cross product of row and column directions.
+        if (Math.abs(cz) < 0.1) {
+          const crossZ = iop[0]*iop[4] - iop[1]*iop[3];
+          cz = crossZ >= 0 ? -1 : 1;
+          console.log(`[REF-LINE]   SAG: iop[5] truncated (${iop[5]}), inferred cz=${cz} from cross product`);
+        }
         const z0      = ipp[2];
         const zExtent = (nRows - 1) * ps[0] * cz;
         console.log(`[REF-LINE]   SAG: cz=${cz} z0=${z0} zExtent=${zExtent} valid=${Math.abs(zExtent) > 1}`);

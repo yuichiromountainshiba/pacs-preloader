@@ -1,10 +1,11 @@
 @echo off
 :: ──────────────────────────────────────────────────────────────────
-:: Install Windows Task Scheduler tasks for PACS Nightly Loader
+:: Install Windows Task Scheduler tasks for PACS Preloader
 ::
-:: Creates two scheduled tasks:
+:: Creates three scheduled tasks:
 ::   1. 9:00 PM Mon-Fri: Run nightly schedule capture
 ::   2. 7:00 AM Tue-Sat: Email summary of last night's run
+::   3. 8:25 AM Mon-Fri: Morning launcher (Epic + browsers + servers)
 ::
 :: Usage:
 ::   Double-click to install (no admin needed)
@@ -13,6 +14,7 @@
 
 set TASK_NIGHTLY=PACS_Nightly_Schedule_Loader
 set TASK_EMAIL=PACS_Morning_Summary_Email
+set TASK_MORNING=PACS_Morning_Launcher
 set SCRIPT_DIR=%~dp0
 set LOG_DIR=%SCRIPT_DIR%logs
 
@@ -21,6 +23,7 @@ if /i "%1"=="/remove" (
     echo Removing scheduled tasks...
     schtasks /Delete /TN "%TASK_NIGHTLY%" /F 2>nul
     schtasks /Delete /TN "%TASK_EMAIL%" /F 2>nul
+    schtasks /Delete /TN "%TASK_MORNING%" /F 2>nul
     echo Done.
     pause
     exit /b 0
@@ -64,12 +67,28 @@ if %errorlevel% equ 0 (
     echo   FAILED: %TASK_EMAIL%
 )
 
+:: ── Task 3: Morning launcher at 8:25 AM Mon-Fri ──
+echo Creating morning launcher task (8:25 AM Mon-Fri)...
+schtasks /Create /TN "%TASK_MORNING%" ^
+    /TR "\"%SCRIPT_DIR%run_morning.bat\"" ^
+    /SC WEEKLY /D MON,TUE,WED,THU,FRI ^
+    /ST 08:25 ^
+    /RL LIMITED ^
+    /F
+
+if %errorlevel% equ 0 (
+    echo   OK: %TASK_MORNING%
+) else (
+    echo   FAILED: %TASK_MORNING%
+)
+
 echo.
 echo ── Setup ──
 echo   1. Store email creds:  python nightly_loader.py --setup-email
 echo   2. Test email:         python nightly_loader.py --send-email
 echo   3. Test capture:       run_nightly.bat
 echo   4. View logs:          dir "%LOG_DIR%\*.log"
-echo   5. Remove tasks:       install_task.bat /remove
+echo   5. Test morning:       run_morning.bat
+echo   6. Remove tasks:       install_task.bat /remove
 echo.
 pause
