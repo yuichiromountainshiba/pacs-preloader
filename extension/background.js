@@ -74,8 +74,22 @@ async function recoverOwnPacsTab() {
     return tid;
   }
 
-  // No owned tabs alive — open a new dedicated tab for this extension
-  debugLog('refresh', 'info', 'refresh', 'No owned PACS tab found — opening dedicated tab', {
+  // No owned tabs alive — try to find an existing logged-in PACS tab first
+  for (const t of pacsTabs) {
+    try {
+      const ping = await withTimeout(_sendTabMessage(t.id, 'ping', {}), 3000, 'ping timeout');
+      if (ping && ping.hasSession) {
+        debugLog('refresh', 'info', 'refresh', `Reclaimed existing logged-in PACS tab ${t.id}`, {
+          subspecialty: typeof SUBSPECIALTY !== 'undefined' ? SUBSPECIALTY.id : 'unknown',
+        });
+        await claimPacsTab(t.id);
+        return t.id;
+      }
+    } catch { /* tab unresponsive or no content script */ }
+  }
+
+  // No logged-in tabs found — open a new dedicated tab
+  debugLog('refresh', 'info', 'refresh', 'No owned or logged-in PACS tab found — opening dedicated tab', {
     subspecialty: typeof SUBSPECIALTY !== 'undefined' ? SUBSPECIALTY.id : 'unknown',
     existing_pacs_tabs: pacsTabs.map(t => t.id),
   });
@@ -455,14 +469,8 @@ async function pollPendingRefreshes() {
         });
       }
 
-      // Even though we can't refresh, expire any auto-refreshes past appointment time
-      for (const [key, meta] of Object.entries(data.pending || {})) {
-        const refreshType = (typeof meta === 'object' && meta.type) ? meta.type : 'auto';
-        if (refreshType === 'auto' && (await isAppointmentPast(key, serverUrl))) {
-          debugLog('refresh', 'info', 'refresh', `Auto-refresh expired (appointment passed): ${key}`);
-          await fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, { method: 'DELETE' }).catch(() => {});
-        }
-      }
+      // Don't expire anything while logged out — wait for login so the main loop
+      // can handle expiry correctly (distinguishing auto vs manual refreshes).
       return;
     }
     // PACS is logged in — clear the notification flag so we re-notify if it logs out again
