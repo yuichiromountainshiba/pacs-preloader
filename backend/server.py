@@ -560,11 +560,13 @@ async def request_refresh(patient_key: str, request: Request):
         raise HTTPException(status_code=404, detail="Patient not found")
     refresh_type = "auto"
     try:
-        body = await request.json()
-        if body.get("type") in ("full", "auto", "today"):
-            refresh_type = body["type"]
-    except Exception:
-        pass  # no body or invalid JSON → default to "auto"
+        raw = await request.body()
+        if raw:
+            body = json.loads(raw)
+            if body.get("type") in ("full", "auto", "today"):
+                refresh_type = body["type"]
+    except Exception as e:
+        print(f"[request-refresh] body parse error for {patient_key}: {e}, raw={raw!r}")
     index["pending_refreshes"][patient_key] = {
         "type": refresh_type,
         "timestamp": datetime.utcnow().isoformat(),

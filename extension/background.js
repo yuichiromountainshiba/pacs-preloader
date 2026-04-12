@@ -442,7 +442,10 @@ async function pollPendingRefreshes() {
     const pendingKeys = Object.keys(data.pending || {});
     if (pendingKeys.length === 0) return;
 
-    debugLog('refresh', 'info', 'refresh', `Found ${pendingKeys.length} pending refresh(es)`, { keys: pendingKeys });
+    debugLog('refresh', 'info', 'refresh', `Found ${pendingKeys.length} pending refresh(es)`, {
+      keys: pendingKeys,
+      types: Object.fromEntries(Object.entries(data.pending || {}).map(([k, v]) => [k, typeof v === 'object' ? v.type : 'legacy'])),
+    });
 
     // ── Check PACS login before attempting any refreshes ──
     let pacsLoggedIn = false;
@@ -604,17 +607,30 @@ async function sendToContentScript(action, data) {
 }
 
 async function sendToContentScriptTab(tabId, action, data) {
+  debugLog('background', 'info', 'tab-message', `Sending "${action}" to tab ${tabId}`, {
+    tab_id: tabId,
+    action,
+    patient_name: data?.name || data?.patient?.name || undefined,
+  });
   try {
-    return await _sendTabMessage(tabId, action, data);
+    const result = await _sendTabMessage(tabId, action, data);
+    debugLog('background', 'pass', 'tab-message', `Tab ${tabId} responded to "${action}"`, {
+      tab_id: tabId,
+      action,
+      has_error: !!result?.error,
+      study_count: result?.studies?.length,
+    });
+    return result;
   } catch (e) {
     if (e.message.includes('Receiving end does not exist')) {
-      console.log('[Preload] content script missing — injecting into tab', tabId);
+      debugLog('background', 'warn', 'tab-message', `Content script missing in tab ${tabId} — re-injecting`, { tab_id: tabId });
       // Must inject config.js first so SUBSPECIALTY is defined when content.js loads
       await chrome.scripting.executeScript({ target: { tabId }, files: ['config.js'] }).catch(() => {});
       await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
       await sleep(400);
       return await _sendTabMessage(tabId, action, data);
     }
+    debugLog('background', 'error', 'tab-message', `Tab ${tabId} message failed: ${e.message}`, { tab_id: tabId, action });
     throw e;
   }
 }

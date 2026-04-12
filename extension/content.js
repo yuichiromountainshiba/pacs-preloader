@@ -378,12 +378,25 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   }
   cleanName = cleanName.replace(/\s+[A-Za-z]\.?$/, '').trim();
   log(`Searching: "${cleanName}" (original: "${name}", DOB: ${dob || 'none'})`);
+  debugLog('content', 'start', 'search', `searchPatientDOM started: "${cleanName}"`, {
+    original_name: name,
+    clean_name: cleanName,
+    dob: dob || 'none',
+    todayOnly,
+    url: window.location.href,
+  });
 
   // ── Find search input ──
   const searchInput = findSearchInput();
   if (!searchInput) {
+    debugLog('content', 'error', 'search', 'FAILED: search input not found (input[name="patientName"])', {
+      patient: cleanName,
+      page_url: window.location.href,
+      iframes: document.querySelectorAll('iframe').length,
+    });
     throw new Error('input[name="patientName"] not found — is the Patient Search page open?');
   }
+  debugLog('content', 'pass', 'search', 'Search input found', { patient: cleanName });
 
   // ── Set date filter ──
   if (todayOnly) {
@@ -413,25 +426,42 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   clearInput(searchInput);
   await sleep(100);
   setInputValue(searchInput, cleanName.toLowerCase());
+  debugLog('content', 'info', 'search', `Typed name into search: "${cleanName.toLowerCase()}"`, {
+    patient: cleanName,
+    input_value_after: searchInput.value,
+  });
   await sleep(100);
 
   const btn = findSearchButton();
   if (btn) {
     log('Clicking Search button');
     btn.click();
+    debugLog('content', 'pass', 'search', 'Search button found and clicked', { patient: cleanName });
   } else {
     log('Search button not found — pressing Enter');
     pressEnter(searchInput);
+    debugLog('content', 'warn', 'search', 'Search button NOT found — pressed Enter instead', { patient: cleanName });
   }
 
   // ── Wait for study table to update ──
   log('Waiting for results...');
+  debugLog('content', 'info', 'search', 'Waiting for study table to update...', { patient: cleanName, preSearchUids: preSearchUids.size });
   const nameParts = cleanName.toLowerCase().split(/[,\s]+/).filter(p => p.length > 1);
 
   let studyRows = null;
+  let pollAttempt = 0;
   try {
     studyRows = await poll(() => {
+      pollAttempt++;
       const rows = parseStudyTable();
+      // Log every 5th poll attempt to avoid flooding
+      if (pollAttempt % 5 === 1) {
+        debugLog('content', 'info', 'search-poll', `Poll #${pollAttempt}: ${rows.length} row(s) in study table`, {
+          patient: cleanName,
+          row_names: rows.slice(0, 5).map(r => r.patientName),
+          row_uids: rows.slice(0, 5).map(r => r.studyUid?.slice(-10)),
+        });
+      }
       if (rows.length === 0) return null;
 
       // Prefer rows matching the searched name
@@ -448,10 +478,21 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
     }, { timeout: 25000, interval: 500, desc: 'search results' });
   } catch {
     log('No results within 25s');
+    debugLog('content', 'warn', 'search', `No results within 25s (polled ${pollAttempt} times)`, {
+      patient: cleanName,
+      todayOnly,
+      final_rows: parseStudyTable().length,
+      final_row_names: parseStudyTable().slice(0, 5).map(r => r.patientName),
+    });
     return { studies: [], patientNamesFound: [] };
   }
 
   log(`Found ${studyRows.length} study row(s)`);
+  debugLog('content', 'pass', 'search', `Search complete: ${studyRows.length} matching study row(s)`, {
+    patient: cleanName,
+    poll_attempts: pollAttempt,
+    studies: studyRows.map(r => ({ name: r.patientName, desc: r.description, date: r.studyDate, modality: r.modality })),
+  });
 
   // ── Click each study row to load its series ──
   const studies = [];
@@ -459,6 +500,12 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   for (let i = 0; i < studyRows.length; i++) {
     const sr = studyRows[i];
     log(`Study ${i+1}/${studyRows.length}: "${sr.description}" [${sr.studyUid.slice(-14)}...]`);
+    debugLog('content', 'info', 'study-click', `Clicking study ${i+1}/${studyRows.length}: "${sr.description}"`, {
+      patient: cleanName,
+      study_uid: sr.studyUid,
+      modality: sr.modality,
+      date: sr.studyDate,
+    });
 
     // Snapshot series before clicking
     const beforeSeriesUids = new Set(parseSeriesTable().map(s => s.seriesUid));
@@ -488,6 +535,11 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
     }
 
     log(`  → ${seriesRows.length} series: ${seriesRows.map(s => s.description || s.seriesUid.slice(-8)).join(', ')}`);
+    debugLog('content', 'info', 'study-click', `Study ${i+1} loaded: ${seriesRows.length} series`, {
+      patient: cleanName,
+      study_desc: sr.description,
+      series: seriesRows.map(s => ({ desc: s.description, uid: s.seriesUid?.slice(-10) })),
+    });
 
     studies.push({
       studyUid:    sr.studyUid,
@@ -1069,6 +1121,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   switch (message.action) {
     case 'searchPatient':
+      debugLog('content', 'info', 'message', `Received searchPatient message`, {
+        name: message.name,
+        dob: message.dob,
+        todayOnly: message.todayOnly,
+        has_filters: !!message.filters,
+      });
       searchPatientDOM(message.name, message.dob, message.debug || false, message.todayOnly || false)
         .then(result => {
           if (message.filters && result.studies) result.studies = filterStudies(result.studies, message.filters);
