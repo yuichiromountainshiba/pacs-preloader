@@ -1907,8 +1907,21 @@
 
     // Detect orientation from label text
     const labelText = labelTextEl ? labelTextEl.textContent : '';
-    const isSag = /\bsag\b/i.test(labelText);
-    const isAx  = /\bax|tra\b/i.test(labelText);
+    const isSag = /\b(sag|sagittal)\b/i.test(labelText);
+    // Explicit alternation + allow "Ax", "AX T2", "axial", "tra", "transverse", "stack" axials
+    let isAx = /\b(ax|axial|tra|transverse)\b/i.test(labelText);
+    // Geometric fallback: if a reference image's orientation row vector points along ±X
+    // and the column vector along ±Y, it's axial regardless of label wording.
+    if (!isAx) {
+      const refImg = images.find(i => Array.isArray(i.imageOrientation) && i.imageOrientation.length === 6);
+      if (refImg) {
+        const iop = refImg.imageOrientation;
+        if (Math.abs(iop[0]) >= 0.7 && Math.abs(iop[4]) >= 0.7 && Math.abs(iop[2]) < 0.5 && Math.abs(iop[5]) < 0.5) {
+          isAx = true;
+          console.log(`[REF-LINE] isAx inferred from geometry for label="${labelText}" iop=[${iop}]`);
+        }
+      }
+    }
 
     // Compute physical image extent for accurate cross-reference line placement.
     // SAG: the line on SAG from an AX slice must land at the correct fraction of SAG's

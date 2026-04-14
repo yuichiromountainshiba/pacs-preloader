@@ -433,13 +433,22 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   await sleep(100);
 
   const btn = findSearchButton();
+  const triggerSearch = () => {
+    if (btn) {
+      // GWT buttons want a full mouse sequence — .click() alone occasionally no-ops
+      const rect = btn.getBoundingClientRect();
+      const evOpts = { bubbles: true, cancelable: true, view: window, clientX: rect.left + 2, clientY: rect.top + 2, button: 0 };
+      btn.dispatchEvent(new MouseEvent('mousedown', evOpts));
+      btn.dispatchEvent(new MouseEvent('mouseup', evOpts));
+      btn.click();
+    } else {
+      pressEnter(searchInput);
+    }
+  };
+  triggerSearch();
   if (btn) {
-    log('Clicking Search button');
-    btn.click();
-    debugLog('content', 'pass', 'search', 'Search button found and clicked', { patient: cleanName });
+    debugLog('content', 'pass', 'search', 'Search button found and clicked (mousedown+mouseup+click)', { patient: cleanName });
   } else {
-    log('Search button not found — pressing Enter');
-    pressEnter(searchInput);
     debugLog('content', 'warn', 'search', 'Search button NOT found — pressed Enter instead', { patient: cleanName });
   }
 
@@ -450,16 +459,26 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
 
   let studyRows = null;
   let pollAttempt = 0;
+  let reclickCount = 0;
   try {
     studyRows = await poll(() => {
       pollAttempt++;
       const rows = parseStudyTable();
+      const currentUids = new Set(rows.map(r => r.studyUid));
+      const tableUnchanged = rows.length > 0 && [...currentUids].every(u => preSearchUids.has(u));
+      // If the study table hasn't changed at all after ~5s and ~12s, re-trigger the search
+      if (tableUnchanged && (pollAttempt === 10 || pollAttempt === 24) && reclickCount < 2) {
+        reclickCount++;
+        debugLog('content', 'warn', 'search-poll', `Table still stale at poll #${pollAttempt} — re-triggering search (attempt ${reclickCount})`, { patient: cleanName });
+        triggerSearch();
+      }
       // Log every 5th poll attempt to avoid flooding
       if (pollAttempt % 5 === 1) {
         debugLog('content', 'info', 'search-poll', `Poll #${pollAttempt}: ${rows.length} row(s) in study table`, {
           patient: cleanName,
           row_names: rows.slice(0, 5).map(r => r.patientName),
           row_uids: rows.slice(0, 5).map(r => r.studyUid?.slice(-10)),
+          stale: tableUnchanged,
         });
       }
       if (rows.length === 0) return null;
@@ -471,7 +490,6 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
       if (matching.length > 0) return matching;
 
       // Accept any change in the study UID set
-      const currentUids = new Set(rows.map(r => r.studyUid));
       if ([...currentUids].some(u => !preSearchUids.has(u))) return rows;
 
       return null;
@@ -742,15 +760,33 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
   let resolvedStudyDate = studyDate || '';
   let resolvedLocation  = studyLocation || '';
 
+  debugLog('content', 'start', 'batch-preload', `batchPreloadStudy: "${studyDescription}" (${series.length} series)`, {
+    patient: patient.name, patient_key: patientKey, study_uid: studyUid, modality, series_count: series.length,
+  });
+
   // ── Step 1: ViewPatInfo for all series, 3 at a time ──
   const viewTasks = series.map(s => async () => {
-    const result = await getStudyImages(studyUid, s.seriesUid);
-    if (result.studyDate && !resolvedStudyDate) resolvedStudyDate = result.studyDate;
-    if (result.location  && !resolvedLocation)  resolvedLocation  = result.location;
-    return { series: s, urls: result.urls || [], studyDate: result.studyDate || '' };
+    try {
+      const result = await getStudyImages(studyUid, s.seriesUid);
+      if (result.studyDate && !resolvedStudyDate) resolvedStudyDate = result.studyDate;
+      if (result.location  && !resolvedLocation)  resolvedLocation  = result.location;
+      return { series: s, urls: result.urls || [], studyDate: result.studyDate || '', error: result.error || null };
+    } catch (e) {
+      return { series: s, urls: [], studyDate: '', error: `ViewPatInfo exception: ${e.message?.slice(0, 120)}` };
+    }
   });
 
   const seriesResults = await pLimit(viewTasks, 3);
+
+  const seriesSummary = seriesResults.map(sr => ({
+    series_desc: sr?.series?.description || '?',
+    url_count: sr?.urls?.length || 0,
+    error: sr?.error || null,
+  }));
+  const totalUrls = seriesSummary.reduce((a, s) => a + s.url_count, 0);
+  debugLog('content', totalUrls > 0 ? 'pass' : 'error', 'batch-preload', `ViewPatInfo done: ${totalUrls} total URLs across ${series.length} series`, {
+    patient: patient.name, patient_key: patientKey, study: studyDescription, per_series: seriesSummary,
+  });
 
   // ── Step 1b: Fetch institution name from first available image (all modalities) ──
   // ViewPatInfo HTML doesn't contain DICOM tags — must use singleimage action
@@ -810,11 +846,12 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
 
     sr.urls.forEach((url, i) => {
       downloadTasks.push(async () => {
+        let failStage = '';
         try {
           const imgResp = await fetch(url, { credentials: 'include' });
-          if (!imgResp.ok) return 0;
+          if (!imgResp.ok) { failStage = `pacs_fetch_http_${imgResp.status}`; throw new Error(failStage); }
           const blob = await imgResp.blob();
-          if (blob.size < 100) return 0;
+          if (blob.size < 100) { failStage = `tiny_blob_${blob.size}B`; throw new Error(failStage); }
 
           const imageUid = getImageUidFromUrl(url);
 
@@ -854,17 +891,37 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
           }
 
           const resp = await fetch(`${serverUrl}/api/images`, { method: 'POST', body: fd });
-          return resp.ok ? 1 : 0;
-        } catch { return 0; }
+          if (!resp.ok) {
+            failStage = `backend_http_${resp.status}`;
+            let body = '';
+            try { body = (await resp.text()).slice(0, 200); } catch {}
+            return { ok: 0, stage: failStage, body };
+          }
+          return { ok: 1 };
+        } catch (e) {
+          return { ok: 0, stage: failStage || `exception_${e.message?.slice(0, 80)}` };
+        }
       });
     });
   }
 
   // ── Step 3: Download + upload all images, 4 at a time ──
   const downloadResults = await pLimit(downloadTasks, 4);
-  const count = downloadResults.reduce((a, b) => (a || 0) + (b || 0), 0);
+  const count = downloadResults.reduce((a, b) => a + (b?.ok || 0), 0);
+  const failures = downloadResults.filter(r => !r?.ok);
+  const failReasons = {};
+  for (const f of failures) {
+    const k = f?.stage || 'unknown';
+    failReasons[k] = (failReasons[k] || 0) + 1;
+  }
 
   console.log(`[PACS-DOM] batchPreloadStudy "${studyDescription}": ${count}/${downloadTasks.length} images`);
+  debugLog('content', count > 0 ? 'pass' : 'error', 'batch-preload', `batchPreloadStudy done: ${count}/${downloadTasks.length} images uploaded`, {
+    patient: patient.name, patient_key: patientKey, study: studyDescription,
+    attempted: downloadTasks.length, succeeded: count, failed: downloadTasks.length - count,
+    failure_reasons: failReasons,
+    sample_failure: failures.find(f => f?.body) || failures[0] || null,
+  });
   return { count, studyDate: resolvedStudyDate };
 }
 

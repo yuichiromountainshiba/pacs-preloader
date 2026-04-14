@@ -74,32 +74,76 @@ async function recoverOwnPacsTab() {
     return tid;
   }
 
-  // No owned tabs alive — try to find an existing logged-in PACS tab first
+  // No owned tabs alive — try to find an existing logged-in PACS tab first.
+  // If ping fails with "Receiving end does not exist" (content script unloaded
+  // after extension reload), re-inject and retry before giving up.
   for (const t of pacsTabs) {
-    try {
-      const ping = await withTimeout(_sendTabMessage(t.id, 'ping', {}), 3000, 'ping timeout');
-      if (ping && ping.hasSession) {
-        debugLog('refresh', 'info', 'refresh', `Reclaimed existing logged-in PACS tab ${t.id}`, {
-          subspecialty: typeof SUBSPECIALTY !== 'undefined' ? SUBSPECIALTY.id : 'unknown',
-        });
-        await claimPacsTab(t.id);
-        return t.id;
+    const tryPing = async () => {
+      try {
+        return await withTimeout(_sendTabMessage(t.id, 'ping', {}), 3000, 'ping timeout');
+      } catch (e) {
+        if (e.message?.includes('Receiving end does not exist')) {
+          await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ['error-reporter.js', 'config.js'] }).catch(() => {});
+          await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ['content.js'] }).catch(() => {});
+          await sleep(500);
+          try { return await withTimeout(_sendTabMessage(t.id, 'ping', {}), 3000, 'ping timeout (retry)'); }
+          catch { return null; }
+        }
+        return null;
       }
-    } catch { /* tab unresponsive or no content script */ }
+    };
+    const ping = await tryPing();
+    if (ping && ping.hasSession) {
+      debugLog('refresh', 'info', 'refresh', `Reclaimed existing logged-in PACS tab ${t.id}`, {
+        url: t.url,
+        subspecialty: typeof SUBSPECIALTY !== 'undefined' ? SUBSPECIALTY.id : 'unknown',
+      });
+      await claimPacsTab(t.id);
+      return t.id;
+    }
   }
 
-  // No logged-in tabs found — open a new dedicated tab
-  debugLog('refresh', 'info', 'refresh', 'No owned or logged-in PACS tab found — opening dedicated tab', {
-    subspecialty: typeof SUBSPECIALTY !== 'undefined' ? SUBSPECIALTY.id : 'unknown',
-    existing_pacs_tabs: pacsTabs.map(t => t.id),
+  // No logged-in tabs found — run deep diagnostics before giving up.
+  const diagnostics = [];
+  for (const t of pacsTabs) {
+    try {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId: t.id },
+        func: () => ({
+          href: location.href,
+          hasSID: !!document.cookie.match(/SID=([^;]+)/),
+          subspecialtyDefined: typeof globalThis.SUBSPECIALTY !== 'undefined',
+          subspecialtyId: globalThis.SUBSPECIALTY?.id,
+          hasIframe: !!document.querySelector('iframe'),
+          iframeSrc: document.querySelector('iframe')?.src,
+        }),
+      });
+      diagnostics.push({ id: t.id, probe: r?.result });
+      // Now try injecting content.js and capture any error via a wrapper func
+      try {
+        const [r2] = await chrome.scripting.executeScript({
+          target: { tabId: t.id },
+          func: async () => {
+            // Load config + content inline by fetching the files and eval? No — just report what's present.
+            return {
+              listenerCount: chrome.runtime ? 'runtime-available' : 'no-runtime',
+              hasSubspecialty: typeof globalThis.SUBSPECIALTY !== 'undefined',
+            };
+          },
+        });
+        diagnostics[diagnostics.length - 1].postInject = r2?.result;
+      } catch (ie) {
+        diagnostics[diagnostics.length - 1].injectError = ie.message?.slice(0, 200);
+      }
+    } catch (pe) {
+      diagnostics.push({ id: t.id, probeError: pe.message?.slice(0, 200) });
+    }
+  }
+  debugLog('refresh', 'warn', 'refresh', 'No logged-in PACS tab — refusing to spawn new tab', {
+    existing_pacs_tabs: pacsTabs.map(t => ({ id: t.id, url: t.url })),
+    diagnostics,
   });
-  const tab = await chrome.tabs.create({ url: 'https://pacs.renoortho.com/InteleBrowser/app', active: false });
-  await waitForTabLoad(tab.id);
-  await sleep(1000);
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['config.js'] }).catch(() => {});
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => {});
-  await claimPacsTab(tab.id);
-  return tab.id;
+  return null;
 }
 
 function ensureAlarms() {
@@ -129,6 +173,28 @@ chrome.alarms.getAll(alarms => {
     ensureAlarms();
   }
 });
+
+// Re-inject content script into any already-open PACS tabs on startup.
+// Reloading the extension unloads the content script from existing tabs;
+// without this, those tabs become silent (ping gets "Receiving end does not exist")
+// until the user manually reloads them.
+async function reinjectContentScripts() {
+  try {
+    const tabs = await chrome.tabs.query({ url: '*://pacs.renoortho.com/*' });
+    for (const t of tabs) {
+      try {
+        await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ['error-reporter.js', 'config.js'] });
+        await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ['content.js'] });
+        debugLog('startup', 'info', 'refresh', `Re-injected content.js into PACS tab ${t.id}`, { url: t.url });
+      } catch (e) {
+        debugLog('startup', 'warn', 'refresh', `Failed to re-inject into tab ${t.id}`, { error: e.message?.slice(0, 120) });
+      }
+    }
+  } catch (e) {
+    debugLog('startup', 'warn', 'refresh', 'reinjectContentScripts query failed', { error: e.message?.slice(0, 120) });
+  }
+}
+reinjectContentScripts();
 
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === 'pollRefreshes') pollPendingRefreshes();
@@ -253,7 +319,7 @@ async function openPacsTabs(n, seedTabId) {
   // Inject content scripts into all tabs (no-op if already injected)
   // config.js must come before content.js so SUBSPECIALTY is defined
   for (const tid of tabIds) {
-    await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['config.js'] }).catch(() => {});
+    await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['error-reporter.js', 'config.js'] }).catch(() => {});
     await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['content.js'] }).catch(() => {});
     await sleep(150);
   }
@@ -449,17 +515,81 @@ async function pollPendingRefreshes() {
 
     // ── Check PACS login before attempting any refreshes ──
     let pacsLoggedIn = false;
-    try {
-      const ping = await withTimeout(
-        _sendTabMessage(pacsTabId, 'ping', {}),
-        5000, 'ping timeout',
-      );
-      pacsLoggedIn = !!(ping && ping.hasSession);
-    } catch { /* tab dead or unresponsive */ }
+    let pingDetail = { tried: [] };
+    const probeTab = async (tid) => {
+      const tab = await chrome.tabs.get(tid).catch(() => null);
+      const tabInfo = { tab_id: tid, url: tab?.url, discarded: tab?.discarded, status: tab?.status };
+      try {
+        const ping = await withTimeout(_sendTabMessage(tid, 'ping', {}), 5000, 'ping timeout');
+        pingDetail.tried.push({ ...tabInfo, hasSession: !!ping?.hasSession, session_keys: ping?.session ? Object.keys(ping.session) : null, user: ping?.session?.UserName || null });
+        return !!(ping && ping.hasSession);
+      } catch (e) {
+        // Listener missing — content script likely unloaded (tab discarded or extension reloaded).
+        // Try re-injecting and retrying once.
+        if (e.message?.includes('Receiving end does not exist') && tab && tab.url && tab.url.includes('pacs.renoortho.com')) {
+          // Step 1: inject a minimal probe to verify chrome.scripting actually works on this tab.
+          let probeResult = null;
+          try {
+            const [r] = await chrome.scripting.executeScript({
+              target: { tabId: tid },
+              func: () => ({
+                href: location.href,
+                hasSID: !!document.cookie.match(/SID=([^;]+)/),
+                cookieSample: document.cookie.slice(0, 200),
+                subspecialtyDefined: typeof globalThis.SUBSPECIALTY !== 'undefined',
+                subspecialtyId: globalThis.SUBSPECIALTY?.id,
+                hasIframe: !!document.querySelector('iframe'),
+              }),
+            });
+            probeResult = r?.result;
+          } catch (pe) {
+            probeResult = { probe_error: pe.message?.slice(0, 150) };
+          }
+          // Step 2: re-inject content.js files + capture any thrown error.
+          let injectError = null;
+          try {
+            await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['error-reporter.js', 'config.js'] });
+            await chrome.scripting.executeScript({ target: { tabId: tid }, files: ['content.js'] });
+          } catch (ie) {
+            injectError = ie.message?.slice(0, 200);
+          }
+          await sleep(700);
+          try {
+            const ping2 = await withTimeout(_sendTabMessage(tid, 'ping', {}), 5000, 'ping timeout (after reinject)');
+            pingDetail.tried.push({ ...tabInfo, reinjected: true, probe: probeResult, injectError, hasSession: !!ping2?.hasSession, user: ping2?.session?.UserName || null });
+            return !!(ping2 && ping2.hasSession);
+          } catch (e2) {
+            pingDetail.tried.push({ ...tabInfo, reinjected: true, probe: probeResult, injectError, error: e2.message?.slice(0, 100) });
+            return false;
+          }
+        }
+        pingDetail.tried.push({ ...tabInfo, error: e.message?.slice(0, 100) });
+        return false;
+      }
+    };
+
+    pacsLoggedIn = await probeTab(pacsTabId);
+
+    // Fallback: owned tab may have navigated away from the main app.
+    // Try any other pacs.renoortho.com tab; if one has a live session, claim it.
+    if (!pacsLoggedIn) {
+      const allTabs = await chrome.tabs.query({}).catch(() => []);
+      const otherPacsTabs = allTabs.filter(t => t.id !== pacsTabId && t.url && t.url.includes('pacs.renoortho.com'));
+      for (const t of otherPacsTabs) {
+        if (await probeTab(t.id)) {
+          debugLog('refresh', 'info', 'refresh', `Owned tab logged out — reclaiming live PACS tab ${t.id}`, { old_tab: pacsTabId, new_tab: t.id, url: t.url });
+          pacsTabId = t.id;
+          await claimPacsTab(t.id).catch(() => {});
+          pacsLoggedIn = true;
+          break;
+        }
+      }
+    }
 
     if (!pacsLoggedIn) {
       debugLog('refresh', 'warn', 'refresh', 'PACS not logged in — skipping refreshes, will retry next poll', {
         pending_count: pendingKeys.length,
+        probes: pingDetail.tried,
       });
       if (!pacsLoginNotified) {
         pacsLoginNotified = true;
@@ -625,7 +755,7 @@ async function sendToContentScriptTab(tabId, action, data) {
     if (e.message.includes('Receiving end does not exist')) {
       debugLog('background', 'warn', 'tab-message', `Content script missing in tab ${tabId} — re-injecting`, { tab_id: tabId });
       // Must inject config.js first so SUBSPECIALTY is defined when content.js loads
-      await chrome.scripting.executeScript({ target: { tabId }, files: ['config.js'] }).catch(() => {});
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['error-reporter.js', 'config.js'] }).catch(() => {});
       await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
       await sleep(400);
       return await _sendTabMessage(tabId, action, data);

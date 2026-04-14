@@ -25,46 +25,24 @@ ViewPatInfo response and caches it in `window.__pacsSessionHost`.
 
 Cookies (including httpOnly JSESSIONID) are sent automatically via `credentials: 'include'`.
 
-## GWT-RPC Search Endpoint
+## Patient Search (DOM-driven)
 
-**URL:** `POST /InteleBrowser/gwt/gwtInteleBrowser/patientSearchService`
-- NOTE: lowercase 'p' and 's' — case sensitive!
+Search is performed directly against the live InteleBrowser page — the content script manipulates the real search input and reads results out of the rendered tables. No GWT-RPC calls are made. This is more robust to server-side version drift since we're using the same UI the user would.
 
-**Headers:**
-```
-Content-Type: text/x-gwt-rpc; charset=utf-8
-X-GWT-Module-Base: https://pacs.renoortho.com/InteleBrowser/gwt/gwtInteleBrowser/
-X-GWT-Permutation: <32-char hex from .cache.js filename>
-```
+**Flow (see `searchPatientDOM` in `extension/content.js`):**
+1. Locate the search input and search button via `findSearchInput()` / `findSearchButton()`.
+2. Set the date-filter radio (`setDateFilterAllDates()` for full preload; `setDateFilterToday()` for during-clinic XR refresh).
+3. Set the input's value using a native setter + `dispatchEvent` so Angular picks up the change, then `pressEnter()`.
+4. Poll for the results table (`findTableByHeader`, `pollSoft`) and parse rows via `parseStudyTable()` → `parseSeriesTable()`.
 
-**Method:** `executeSearch` (not searchPatients or getStaticData)
+**Input normalization:**
+- Name must be in `LAST, FIRST` format (no middle initials — PACS stores `LAST, FIRST` only).
+- DOB is NOT entered into the search UI; DOB is filtered client-side after results return (`normalizeDob` + `filterStudies`).
 
-**GWT Hash:** `1A63E8AED192E6C86BFBF55C94BF69AD` (version-specific, may change on update)
-
-**Payload structure:** Pipe-delimited GWT-RPC format with 25 string table entries:
-- String 13 = patient name search term (lowercase, "last, first" format)
-- Search uses `patientName` field with `BEGINS` operator
-- No DOB in search — DOB filtering is done client-side after results return
-- Middle initials must be stripped before searching (PACS stores "LAST, FIRST" only)
-- Date range is encoded as GWT date tokens (base-64 of millisecond timestamp)
-
-**Response format:** `//OK[...numeric_data...,["string_table_array"],0,7]`
-- String table is a JSON array embedded near the end of the response
-- Contains DICOM UIDs, patient names, study descriptions, series descriptions
-- GWT uses `\x3D` style hex escapes that must be converted to `\u003D` for JSON.parse
-- String table parser must properly handle quoted strings containing brackets/escapes
-
-**Key string table content patterns:**
-- DICOM UIDs: `1.2.840.113...` (20+ chars, dots and digits)
-- Study descriptions: start with modality prefix like `XR `, `MR-`, `CT `, `DX-`
-- Patient names: `LASTNAME, FIRSTNAME` format (all caps)
-- DOBs: 8-digit strings like `19601213` (YYYYMMDD)
-- Series descriptions: `AP`, `LATERAL`, `SAG T2`, etc.
-
-**Study/series structure in string table:**
-- Series descriptions + UIDs appear BEFORE their parent study description + UID
-- Study description is followed within ~3 positions by its study UID
-- Patient name and DOB appear before the study's series data
+**Study/series parsing:**
+- `parseStudyTable()` extracts study rows (date, description, modality, UID).
+- `parseSeriesTable()` extracts per-series rows; a series UID must be attached to each study before image retrieval.
+- `filterStudies()` applies region keywords and `seriesExclusions` from `SUBSPECIALTY` (see `extension/config.js`).
 
 ## Image Retrieval Endpoint
 
@@ -250,6 +228,7 @@ X-rays taken just before the appointment.
 - PACS login field IDs: if they change, update `username_selector` /
   `password_selector` in `config.json` (use `--inspect-pacs` to check)
 - PACS session may expire overnight — automation re-logs in each run
+- If InteleBrowser UI changes, `findSearchInput()` / `findSearchButton()` / `findTableByHeader()` selectors in `content.js` may need updating — inspect the live page in DevTools and adjust
 - Scrollbar handling: when >30 patients, scrollbar appears and may shift
   the right edge of the table. The capture region detection accounts for
   this with a 20px margin (`SCROLLBAR_MARGIN`) but templates may need

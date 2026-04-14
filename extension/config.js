@@ -2,7 +2,11 @@
 // This is the only file that differs between extension variants.
 // Loaded as a content script (before content.js) and via <script> in popup.html.
 
-const SUBSPECIALTY = {
+// Use globalThis assignment so this works both as a manifest content script
+// (shared top-level scope with content.js) AND as a dynamic injection via
+// chrome.scripting.executeScript, where each file runs in its own IIFE and
+// top-level `const`/`let` do NOT leak to subsequent injections.
+globalThis.SUBSPECIALTY = globalThis.SUBSPECIALTY || {
   name: 'Spine',
   id:   'spine',
 
