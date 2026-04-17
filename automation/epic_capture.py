@@ -255,12 +255,24 @@ def launch_epic(config):
 
 
 def login_epic(hwnd, config):
-    """Log in to Epic using credentials from Windows Credential Manager."""
+    """Log in to Epic using credentials from Windows Credential Manager.
+
+    Keyboard-driven flow (no image templates):
+      1. Focus + click center of the Epic window so a control owns focus
+      2. Tab → username field → type user
+      3. Tab → password field → type pass
+      4. Enter → submit login
+      5. Wait 1s, Enter → dismiss context/department screen
+      6. Wait 1s for the schedule to settle
+
+    This replaces the previous template-based approach (username_field.png /
+    password_field.png), which broke whenever Epic's font, theme, or layout
+    shifted. Tab order and Enter are stable across Epic versions; if they
+    ever change, this single function is the only thing to update.
+    """
     epic_cfg = config["epic"]
     service = epic_cfg["credential_service"]
-    timeout = epic_cfg["login_timeout"]
 
-    # Retrieve credentials
     username = keyring.get_password(service, "__username__")
     if not username:
         raise RuntimeError(
@@ -275,32 +287,41 @@ def login_epic(hwnd, config):
         focus_window(hwnd)
         time.sleep(0.5)
 
-        # Type username
-        screen = grab_screen()
-        if not click_template("username_field.png", screen=screen):
-            raise RuntimeError("Could not find username field on screen")
+        # Click the center of the Epic window so a child control takes focus.
+        # Without this, SetForegroundWindow alone may leave focus on the
+        # window frame and the first Tab goes nowhere useful.
+        #
+        # Guard against bogus rects (e.g. window still restoring) which would
+        # send the mouse to (0,0) and trigger pyautogui's failsafe.
+        rect = get_window_rect(hwnd)
+        screen_w, screen_h = pyautogui.size()
+        if rect["width"] > 200 and rect["height"] > 200:
+            cx = max(50, min(screen_w - 50, rect["left"] + rect["width"] // 2))
+            cy = max(50, min(screen_h - 50, rect["top"] + rect["height"] // 2))
+            try:
+                pyautogui.click(cx, cy)
+            except pyautogui.FailSafeException:
+                log.warning(f"pyautogui failsafe on click at ({cx},{cy}) — skipping click, relying on focus_window")
+        else:
+            log.warning(f"Epic window rect looks invalid ({rect}) — skipping focus click")
+        time.sleep(0.3)
+
+        pyautogui.press("tab")
+        time.sleep(0.2)
         pyautogui.typewrite(username, interval=0.05)
 
-        # Type password
-        screen = grab_screen()
-        if not click_template("password_field.png", screen=screen):
-            raise RuntimeError("Could not find password field on screen")
+        pyautogui.press("tab")
+        time.sleep(0.2)
         pyautogui.typewrite(password, interval=0.05)
 
-        # Press Enter to submit login
         pyautogui.press("enter")
         log.info("Pressed Enter to submit login")
+        time.sleep(1.0)
 
-        # Wait for login to complete (username field disappears)
-        elapsed = 0
-        poll_interval = 2
-        while elapsed < timeout:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            if not find_on_screen("username_field.png"):
-                log.info(f"Login completed after {elapsed}s")
-                return
-        raise RuntimeError(f"Login did not complete within {timeout}s")
+        # Context / department screen — just press Enter to accept the default.
+        pyautogui.press("enter")
+        log.info("Pressed Enter on context screen")
+        time.sleep(1.0)
     finally:
         # Clear password from memory
         del password
@@ -512,46 +533,42 @@ def open_and_login_pacs(config):
 
         time.sleep(page_load_wait)
 
-        # ── Fill login form via JavaScript ──
-        # Use json.dumps to safely escape credentials for JS string literals
-        js_user = json.dumps(username)
-        js_pass = json.dumps(password)
-
-        fill_js = f"""
-        (function() {{
-            var userEl = document.querySelector('{username_sel}');
-            var passEl = document.querySelector('{password_sel}');
-            if (!userEl || !passEl) return 'fields_not_found';
-
-            // Use native setter to bypass Angular/React wrappers
-            var nativeSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            ).set;
-
-            // Check autofill first
-            var needUser = !userEl.value;
-            var needPass = !passEl.value;
-
-            if (needUser) {{
-                nativeSetter.call(userEl, {js_user});
-                userEl.dispatchEvent(new Event('input', {{bubbles: true}}));
-                userEl.dispatchEvent(new Event('change', {{bubbles: true}}));
-            }}
-            if (needPass) {{
-                nativeSetter.call(passEl, {js_pass});
-                passEl.dispatchEvent(new Event('input', {{bubbles: true}}));
-                passEl.dispatchEvent(new Event('change', {{bubbles: true}}));
-            }}
-
-            return 'filled';
-        }})();
-        """
-        result = _cdp_eval(ws, fill_js, msg_id=2)
-        if result == "fields_not_found":
+        # ── Fill login form via CDP Input.insertText ──
+        # Verify both fields exist, then fill via CDP Input.insertText so
+        # Angular sees the values as real keystrokes (not programmatic
+        # assignment, which it silently ignores).
+        fields_present = _cdp_eval(
+            ws,
+            f"!!document.querySelector('{username_sel}') && !!document.querySelector('{password_sel}')",
+            msg_id=2,
+        )
+        if not fields_present:
             log.warning("Login fields not found in DOM — may already be logged in")
             ws.close()
             return None
-        log.info(f"Login form filled: {result}")
+
+        def _focus_and_type(selector, text, msg_id_base):
+            # Clear any existing value, focus the field, insert text.
+            _cdp_eval(
+                ws,
+                f"(function(){{var e=document.querySelector('{selector}');if(e){{e.focus();e.value='';}}}})()",
+                msg_id=msg_id_base,
+            )
+            _cdp_send(ws, "Input.insertText", {"text": text}, msg_id=msg_id_base + 1)
+
+        _focus_and_type(username_sel, username, msg_id_base=20)
+        _focus_and_type(password_sel, password, msg_id_base=30)
+
+        # Sanity check: did the values actually land?
+        filled_user_len = _cdp_eval(
+            ws, f"(document.querySelector('{username_sel}').value || '').length", msg_id=40
+        )
+        filled_pass_len = _cdp_eval(
+            ws, f"(document.querySelector('{password_sel}').value || '').length", msg_id=41
+        )
+        log.info(f"Login form filled: user={filled_user_len} chars, pass={filled_pass_len} chars")
+        if not filled_user_len or not filled_pass_len:
+            log.warning("Credentials did not stick in the fields — login will likely fail")
 
         # Small delay for Angular to process the input events
         time.sleep(0.5)
@@ -744,10 +761,38 @@ def find_epic_window():
 
 
 def focus_window(hwnd):
-    """Bring a window to foreground and maximize it."""
+    """Bring a window to foreground and maximize it.
+
+    Handles minimized state (SW_MAXIMIZE alone does not un-minimize) and
+    works around Windows' focus-stealing prevention by briefly attaching
+    input state from the current foreground window's thread.
+    """
+    user32 = ctypes.windll.user32
+    SW_RESTORE = 9
     SW_MAXIMIZE = 3
-    ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+    # If minimized, restore first
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.2)
+
+    user32.ShowWindow(hwnd, SW_MAXIMIZE)
+
+    # Attach input thread to bypass focus-stealing prevention, then
+    # SetForegroundWindow reliably activates the window.
+    fg_hwnd = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+    cur_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    attached = False
+    if fg_thread and fg_thread != cur_thread:
+        attached = bool(user32.AttachThreadInput(fg_thread, cur_thread, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(fg_thread, cur_thread, False)
     time.sleep(0.5)
 
 
@@ -927,13 +972,25 @@ def capture_with_scroll(schedule_region, epic_rect):
     screenshots = []
     prev_screen = None
 
-    # Move mouse into the schedule area so scroll events target it
-    cx = schedule_region["left"] + schedule_region["width"] // 2
-    cy = schedule_region["top"] + schedule_region["height"] // 2
-    pyautogui.moveTo(cx, cy)
+    # Mouse positions:
+    #   park_xy  — off the schedule list so no row is hover-highlighted during capture
+    #   scroll_xy — inside the schedule so wheel events target the list
+    screen_w, screen_h = pyautogui.size()
+    sched_cx = schedule_region["left"] + schedule_region["width"] // 2
+    sched_cy = schedule_region["top"] + schedule_region["height"] // 2
+    scroll_xy = (sched_cx, sched_cy)
+    # Park at the right edge of the screen, vertically centered — clear of
+    # the list and away from all four corners (pyautogui failsafe).
+    park_xy = (screen_w - 5, screen_h // 2)
+
+    pyautogui.moveTo(*park_xy)
     time.sleep(0.3)
 
     for i in range(MAX_SCROLLS + 1):
+        # Park mouse off the list so no row is hover-highlighted
+        pyautogui.moveTo(*park_xy)
+        time.sleep(0.2)
+
         # Capture current view
         current_cv = grab_screen(schedule_region)
         current_pil = grab_screen_pil(schedule_region)
@@ -958,8 +1015,11 @@ def capture_with_scroll(schedule_region, epic_rect):
 
         prev_screen = current_cv.copy()
 
-        # Scroll down
-        pyautogui.scroll(-5)  # negative = scroll down
+        # Move mouse into the schedule area so the scroll wheel targets it,
+        # then scroll down. The next loop iteration will park it again.
+        pyautogui.moveTo(*scroll_xy)
+        time.sleep(0.1)
+        pyautogui.scroll(-5)
         time.sleep(SCROLL_PAUSE)
 
     log.info(f"Captured {len(screenshots)} page(s) total")
@@ -1106,7 +1166,9 @@ def capture_schedule(target_date, dry_run=False, config=None):
     if needs_login:
         log.info("Login screen detected — logging in...")
         login_epic(hwnd, config)
-        handle_context_screen(config)
+        # Context screen is handled inside login_epic now (second Enter).
+        # Keep a short extra settle in case the schedule view is still rendering.
+        time.sleep(config["epic"].get("post_login_settle", 2.5))
         # Re-acquire window handle (may change after login)
         windows = find_epic_window()
         if windows:

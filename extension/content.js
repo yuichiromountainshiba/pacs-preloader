@@ -12,6 +12,18 @@
 
 'use strict';
 
+// Guard against double-injection. Both the manifest content_scripts block
+// and background.js `chrome.scripting.executeScript` can inject content.js
+// into the same frame. Without this guard, the second load throws on the
+// first top-level `const` (e.g. `_contentDebugQueue`), aborting the entire
+// file and silently killing the message listener registered by the first
+// successful load — the tab becomes a zombie that pings back
+// `hasSession: false` forever.
+if (globalThis.__pacsContentLoaded) {
+  console.log('[PACS-DOM] Content script already loaded — skipping duplicate injection');
+} else {
+  globalThis.__pacsContentLoaded = true;
+
 console.log('[PACS-DOM] Content script loaded (DOM v2.0.0)');
 
 // ── Debug logging helper (sends to server dashboard) ──
@@ -929,7 +941,7 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
 // IMAGE RETRIEVAL (ViewPatInfo)  — identical to original
 // ══════════════════════════════════════════════════════════════════════
 
-async function getStudyImages(studyUid, seriesUid) {
+async function getStudyImages(studyUid, seriesUid, _retryOn401 = true) {
   const session = getSessionParams();
   console.log(`[PACS-DOM] ViewPatInfo: study=...${studyUid.slice(-12)} series=...${seriesUid.slice(-12)}`);
 
@@ -959,6 +971,13 @@ async function getStudyImages(studyUid, seriesUid) {
         body: formData.toString(),
         credentials: 'include'
       });
+      if (response.status === 401 && _retryOn401) {
+        // Stale SessionHost (common cause): drop cache, re-read session, retry once.
+        console.warn('[PACS-DOM] ViewPatInfo 401 — clearing cached SessionHost and retrying once');
+        try { debugLog('content', 'warn', 'batch-preload', 'ViewPatInfo 401 — clearing SessionHost and retrying', { study_uid: studyUid, series_uid: seriesUid, had_cached_host: !!window.__pacsSessionHost }); } catch {}
+        delete window.__pacsSessionHost;
+        return await getStudyImages(studyUid, seriesUid, false);
+      }
       if (!response.ok) throw new Error(`ViewPatInfo HTTP ${response.status}`);
 
       const html = await response.text();
@@ -1228,3 +1247,5 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 console.log('[PACS-DOM] Ready');
+
+} // end double-injection guard

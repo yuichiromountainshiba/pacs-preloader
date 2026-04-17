@@ -55,6 +55,7 @@ import uvicorn
 DATA_DIR = Path("./pacs_data")
 IMAGES_DIR = DATA_DIR / "images"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+AUTOMATION_LOG_DIR = Path(__file__).resolve().parent.parent / "automation" / "logs"
 
 app = FastAPI(title="PACS Preloader")
 
@@ -1467,6 +1468,75 @@ def clear_debug_log():
     except Exception:
         pass
     return {"ok": True}
+
+def _patient_initials(name: str) -> str:
+    """HIPAA-safe initials from 'Last, First' or 'First Last'."""
+    if not name:
+        return "??"
+    name = name.strip()
+    if "," in name:
+        last, _, first = name.partition(",")
+        last = last.strip()
+        first = first.strip().split()
+        return ((first[0][0] if first else "") + (last[0] if last else "")).upper() or "??"
+    parts = name.split()
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[-1][0]).upper()
+    return parts[0][:2].upper() if parts else "??"
+
+
+@app.post("/api/preload_summary")
+async def post_preload_summary(req: Request):
+    """Write a HIPAA-safe preload result summary to automation/logs/preload_YYYYMMDD.txt."""
+    body = await req.json()
+    clinic_date = str(body.get("clinic_date") or datetime.now().strftime("%Y-%m-%d"))
+    started_at = str(body.get("started_at") or "")
+    finished_at = str(body.get("finished_at") or "")
+    elapsed_ms = int(body.get("elapsed_ms") or 0)
+    total_images = int(body.get("total_images") or 0)
+    tabs_used = int(body.get("tabs_used") or 0)
+    patients = body.get("patients") or []
+
+    AUTOMATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    date_compact = clinic_date.replace("-", "")
+    out = AUTOMATION_LOG_DIR / f"preload_{date_compact}.txt"
+
+    succeeded = [p for p in patients if not p.get("error") and int(p.get("images") or 0) > 0]
+    failed = [p for p in patients if p.get("error") or int(p.get("images") or 0) == 0]
+
+    lines = []
+    lines.append("PACS Preloader - Morning Preload Summary")
+    lines.append("=" * 40)
+    lines.append(f"Clinic date:   {clinic_date}")
+    lines.append(f"Started:       {started_at}")
+    lines.append(f"Finished:      {finished_at}")
+    lines.append(f"Elapsed:       {elapsed_ms/1000:.1f}s")
+    lines.append(f"Tabs used:     {tabs_used}")
+    lines.append(f"Total images:  {total_images}")
+    lines.append(f"Patients:      {len(patients)}  (ok: {len(succeeded)}, failed: {len(failed)})")
+    lines.append("")
+
+    if succeeded:
+        lines.append(f"Successful ({len(succeeded)})")
+        lines.append("-" * 40)
+        lines.append(f"{'Init':<6}{'Images':>8}  Studies")
+        for p in succeeded:
+            init = _patient_initials(str(p.get("name") or ""))
+            lines.append(f"{init:<6}{int(p.get('images') or 0):>8}  {int(p.get('studies') or 0)}")
+        lines.append("")
+
+    if failed:
+        lines.append(f"Failed ({len(failed)})")
+        lines.append("-" * 40)
+        for p in failed:
+            init = _patient_initials(str(p.get("name") or ""))
+            err = str(p.get("error") or "no images").strip()[:80]
+            lines.append(f"{init:<6}  {err}")
+        lines.append("")
+
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return {"ok": True, "path": str(out), "succeeded": len(succeeded), "failed": len(failed)}
+
 
 @app.get("/debug", response_class=HTMLResponse)
 def debug_dashboard():

@@ -695,7 +695,10 @@ async function pollPendingRefreshes() {
       await updateRefreshStatus(serverUrl, key, 'searching', `Searching PACS for ${patient.name}`);
 
       try {
-        const ptClinicDate = clinicDate || patient.clinic_date || '';
+        // Prefer the patient's own clinic_date so a stale extension-wide
+        // clinicDate (from a prior preload run) can't overwrite it on
+        // registerPatientPlaceholder and push the patient off "today".
+        const ptClinicDate = patient.clinic_date || clinicDate || '';
         // Wrap preloadPatient in a timeout so a hung content script can't block forever
         await withTimeout(
           preloadPatient(patient, serverUrl, ptClinicDate, filters, undefined, { todayOnly, patientKey: key }),

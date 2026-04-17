@@ -3,9 +3,9 @@
 :: Install Windows Task Scheduler tasks for PACS Preloader
 ::
 :: Creates three scheduled tasks:
-::   1. 9:00 PM Mon-Fri: Run nightly schedule capture
-::   2. 7:00 AM Tue-Sat: Email summary of last night's run
-::   3. 8:25 AM Mon-Fri: Morning launcher (Epic + browsers + servers)
+::   1. 7:00 PM Mon-Fri: Run nightly schedule capture
+::   2. 9:30 PM Mon-Fri: Email summary of last night's run
+::   3. 8:15 AM Mon-Fri: Morning launcher (Epic + browsers + servers)
 ::
 :: Usage:
 ::   Double-click to install (no admin needed)
@@ -37,12 +37,12 @@ echo.
 echo === PACS Preloader — Task Scheduler Setup ===
 echo.
 
-:: ── Task 1: Nightly capture at 9 PM Mon-Fri ──
-echo Creating nightly capture task (9:00 PM Mon-Fri)...
+:: ── Task 1: Nightly capture at 7 PM Mon-Fri ──
+echo Creating nightly capture task (7:00 PM Mon-Fri)...
 schtasks /Create /TN "%TASK_NIGHTLY%" ^
     /TR "\"%SCRIPT_DIR%run_nightly.bat\"" ^
     /SC WEEKLY /D MON,TUE,WED,THU,FRI ^
-    /ST 21:00 ^
+    /ST 19:00 ^
     /RL LIMITED ^
     /F
 
@@ -52,12 +52,12 @@ if %errorlevel% equ 0 (
     echo   FAILED: %TASK_NIGHTLY%
 )
 
-:: ── Task 2: Email summary at 7 AM Tue-Sat ──
-echo Creating morning email task (7:00 AM Tue-Sat)...
+:: ── Task 2: Email summary at 9:30 PM Mon-Fri ──
+echo Creating summary email task (9:30 PM Mon-Fri)...
 schtasks /Create /TN "%TASK_EMAIL%" ^
     /TR "\"%SCRIPT_DIR%send_summary.bat\"" ^
-    /SC WEEKLY /D TUE,WED,THU,FRI,SAT ^
-    /ST 07:00 ^
+    /SC WEEKLY /D MON,TUE,WED,THU,FRI ^
+    /ST 21:30 ^
     /RL LIMITED ^
     /F
 
@@ -67,12 +67,12 @@ if %errorlevel% equ 0 (
     echo   FAILED: %TASK_EMAIL%
 )
 
-:: ── Task 3: Morning launcher at 8:25 AM Mon-Fri ──
-echo Creating morning launcher task (8:25 AM Mon-Fri)...
+:: ── Task 3: Morning launcher at 8:15 AM Mon-Fri ──
+echo Creating morning launcher task (8:15 AM Mon-Fri)...
 schtasks /Create /TN "%TASK_MORNING%" ^
     /TR "\"%SCRIPT_DIR%run_morning.bat\"" ^
     /SC WEEKLY /D MON,TUE,WED,THU,FRI ^
-    /ST 08:25 ^
+    /ST 08:15 ^
     /RL LIMITED ^
     /F
 
