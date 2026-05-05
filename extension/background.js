@@ -324,6 +324,18 @@ async function openPacsTabs(n, seedTabId) {
     await sleep(150);
   }
 
+  // Wait for each tab's GWT search iframe to actually be present before
+  // returning. The InteleBrowser app builds the iframe asynchronously after
+  // window.load, so a freshly-opened tab won't have input[name="patientName"]
+  // for several seconds. Without this, the first round of searchPatient calls
+  // fails with "search input not found" and the patients are never retried.
+  for (const tid of tabIds) {
+    const ready = await waitForSearchInputReady(tid, 30000);
+    debugLog('background', ready ? 'pass' : 'warn', 'tab-init',
+      ready ? `Tab ${tid} search iframe ready` : `Tab ${tid} search iframe not ready after 30s — searches may fail`,
+      { tab_id: tid });
+  }
+
   return { tabIds, openedByUs };
 }
 
@@ -334,6 +346,27 @@ async function waitForTabLoad(tabId, timeout = 20000) {
     if (!tab || tab.status === 'complete') return;
     await sleep(500);
   }
+}
+
+// Polls the content script in `tabId` until input[name="patientName"] is
+// present in the GWT iframe, or the timeout elapses. Returns true on success.
+async function waitForSearchInputReady(tabId, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const result = await new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(tabId, { action: 'probeSearchInput' }, response => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(response);
+        });
+      });
+      if (result?.ready) return true;
+    } catch (e) {
+      // Content script may not be injected yet; keep polling.
+    }
+    await sleep(500);
+  }
+  return false;
 }
 
 
@@ -351,23 +384,70 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
     filters_regions: filters?.regions,
   });
 
-  const result = await sendToContentScriptTab(tabId || pacsTabId, 'searchPatient', {
+  const targetTab = tabId || pacsTabId;
+  const attempts = [pt.name];
+  let result = await sendToContentScriptTab(targetTab, 'searchPatient', {
     name: pt.name,
     dob: pt.dob,
     filters,
     todayOnly,
   });
 
+  // If the GWT iframe wasn't ready (race against tab init), wait for it and
+  // retry once. This is the failure mode that lost 7/15 patients on 2026-05-03.
+  if (result.error && /patientName.*not found|Patient Search page/i.test(result.error)) {
+    debugLog('preload', 'warn', 'search', `Search input not ready for ${pt.name} — waiting and retrying`, {
+      patient_key: patientKey || undefined,
+      tab_id: targetTab,
+    });
+    const ready = await waitForSearchInputReady(targetTab, 30000);
+    if (ready) {
+      result = await sendToContentScriptTab(targetTab, 'searchPatient', {
+        name: pt.name,
+        dob: pt.dob,
+        filters,
+        todayOnly,
+      });
+    }
+  }
+
   if (result.error) {
     debugLog('preload', 'error', 'search', `Search error: ${pt.name}`, { patient_key: patientKey || undefined, error: result.error });
     postToPopup({ action: 'preloadLog', text: `  ✗ Search error: ${result.error}`, cls: 'error' });
-    if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'error', result.error);
+    if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'error', result.error, attempts);
     return 0;
   }
+
+  // First-letter fallback: handles Tom/Thomas, Bob/Robert, etc. The DOB
+  // filter still narrows the (potentially huge) "Smith, T" result set down
+  // to the right person, so this is safe even on common surnames.
   if (!result.studies || result.studies.length === 0) {
-    debugLog('preload', 'warn', 'search', `No studies found: ${pt.name}`, { patient_key: patientKey || undefined });
-    postToPopup({ action: 'preloadLog', text: `  ✗ No studies found — adding to viewer for manual refresh`, cls: 'error' });
-    if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'no_results', 'No studies found in PACS');
+    const fallbackName = buildFallbackName(pt.name);
+    if (fallbackName && fallbackName !== pt.name) {
+      attempts.push(fallbackName);
+      debugLog('preload', 'info', 'search', `Primary search empty — retrying with fallback "${fallbackName}"`, {
+        patient_key: patientKey || undefined,
+        original: pt.name,
+        fallback: fallbackName,
+      });
+      postToPopup({ action: 'preloadLog', text: `  ↻ No primary match — trying alt: ${fallbackName}`, cls: 'info' });
+      if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'searching', `Trying alt: ${fallbackName}`, attempts);
+      result = await sendToContentScriptTab(targetTab, 'searchPatient', {
+        name: fallbackName,
+        dob: pt.dob,
+        filters,
+        todayOnly,
+      });
+    }
+  }
+
+  if (!result.studies || result.studies.length === 0) {
+    debugLog('preload', 'warn', 'search', `No studies found: ${pt.name}`, { patient_key: patientKey || undefined, attempts });
+    const detail = attempts.length > 1
+      ? `No studies — tried: ${attempts.join(' + ')}`
+      : 'No studies found in PACS';
+    postToPopup({ action: 'preloadLog', text: `  ✗ ${detail}`, cls: 'error' });
+    if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'no_results', detail, attempts);
     return 0;
   }
 
@@ -402,10 +482,10 @@ async function preloadPatient(pt, serverUrl, clinicDate, filters, tabId, { today
   }
 
   const eligibleStudies = result.studies.filter(s => s.series && s.series.length > 0);
-  if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'downloading', `${eligibleStudies.length} study(ies) found — downloading images`);
+  if (patientKey) await updateRefreshStatus(serverUrl, patientKey, 'downloading', `${eligibleStudies.length} study(ies) found — downloading images`, attempts);
   const sentResults = await Promise.all(
     eligibleStudies.map(study =>
-      sendToContentScriptTab(tabId || pacsTabId, 'batchPreloadStudy', {
+      sendToContentScriptTab(targetTab, 'batchPreloadStudy', {
         studyUid:         study.studyUid,
         series:           study.series,
         patient:          { name: pt.name, dob: pt.dob, provider: pt.provider || '' },
@@ -784,12 +864,24 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function updateRefreshStatus(serverUrl, key, status, detail) {
+function updateRefreshStatus(serverUrl, key, status, detail, attempts) {
+  const body = { status, detail };
+  if (attempts) body.attempts = attempts;
   return fetch(`${serverUrl}/api/pending_refreshes/${encodeURIComponent(key)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ status, detail }),
+    body: JSON.stringify(body),
   }).catch(() => {});
+}
+
+// "Smith, Tom" → "Smith, T". Returns null if there's nothing to truncate
+// (no comma, missing first name, or first name already a single letter).
+function buildFallbackName(name) {
+  if (!name || !name.includes(',')) return null;
+  const [last, rest = ''] = name.split(',').map(s => s.trim());
+  const first = rest.split(/\s+/)[0] || '';
+  if (!last || first.length < 2) return null;
+  return `${last}, ${first[0]}`;
 }
 
 function withTimeout(promise, ms, message) {

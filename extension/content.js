@@ -54,6 +54,61 @@ async function _flushContentDebug() {
   } catch (e) { /* best-effort */ }
 }
 
+// ── Visibility / throttling diagnostics ──
+// Chrome clamps setTimeout/setInterval in hidden tabs (≥1s after hide,
+// up to 1/min after ~5 min). Our poll() and sleep() loops sit on top of
+// setTimeout, so a hidden PACS tab will run noticeably slower. These
+// helpers let us correlate slow operations with visibility state.
+const _visState = {
+  current: typeof document !== 'undefined' ? document.visibilityState : 'unknown',
+  hiddenSince: typeof document !== 'undefined' && document.hidden ? Date.now() : null,
+  totalHiddenMs: 0,
+  changes: 0,
+};
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    const now = Date.now();
+    const next = document.visibilityState;
+    if (_visState.current === 'hidden' && _visState.hiddenSince) {
+      _visState.totalHiddenMs += now - _visState.hiddenSince;
+    }
+    _visState.hiddenSince = next === 'hidden' ? now : null;
+    _visState.current = next;
+    _visState.changes++;
+    debugLog('content', 'info', 'visibility', `visibilitychange → ${next}`, {
+      has_focus: document.hasFocus(),
+      hidden: document.hidden,
+    });
+  });
+}
+
+function visSnapshot() {
+  const cumHidden = _visState.current === 'hidden' && _visState.hiddenSince
+    ? _visState.totalHiddenMs + (Date.now() - _visState.hiddenSince)
+    : _visState.totalHiddenMs;
+  return {
+    visibility: typeof document !== 'undefined' ? document.visibilityState : 'unknown',
+    has_focus: typeof document !== 'undefined' ? document.hasFocus() : null,
+    visibility_changes: _visState.changes,
+    cumulative_hidden_ms: cumHidden,
+  };
+}
+
+// Schedule a setTimeout with a known target and report actual elapsed.
+// Foreground: ~target. Hidden tab: ≥1000ms (Tier-1 clamp). Hidden >5min:
+// up to ~60000ms (intensive throttling). Run in parallel with real work
+// so it doesn't slow anything down.
+function probeTimerLatency(opLabel, extra = {}, targetMs = 100) {
+  const start = performance.now();
+  setTimeout(() => {
+    const actualMs = Math.round(performance.now() - start);
+    const clamped = actualMs >= targetMs * 4;  // crude flag for "throttled"
+    debugLog('content', clamped ? 'warn' : 'info', 'timer-probe',
+      `timer latency probe (${opLabel}): scheduled ${targetMs}ms, fired at ${actualMs}ms${clamped ? ' [THROTTLED]' : ''}`,
+      { ...extra, target_ms: targetMs, actual_ms: actualMs, throttled: clamped, ...visSnapshot() });
+  }, targetMs);
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // UTILITIES
 // ══════════════════════════════════════════════════════════════════════
@@ -382,13 +437,19 @@ function parseSeriesTable() {
 async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
   const log = msg => console.log('[PACS-DOM]', msg);
 
-  // Clean name (strip middle initial — same as original)
-  let cleanName = name;
+  // Clean name (strip middle initial — same as original).
+  // The trailing-initial regex only runs in the no-comma branch — otherwise
+  // a deliberate single-letter first name like "Smith, T" (used by the
+  // first-letter fallback search) would get stripped to "Smith,".
+  let cleanName = name.trim();
   if (cleanName.includes(',')) {
     const parts = cleanName.split(',').map(s => s.trim());
     cleanName = `${parts[0]}, ${(parts[1] || '').split(/\s+/)[0]}`;
+  } else {
+    cleanName = cleanName.replace(/\s+[A-Za-z]\.?$/, '').trim();
   }
-  cleanName = cleanName.replace(/\s+[A-Za-z]\.?$/, '').trim();
+  const _searchT0 = performance.now();
+  const _searchVis0 = visSnapshot();
   log(`Searching: "${cleanName}" (original: "${name}", DOB: ${dob || 'none'})`);
   debugLog('content', 'start', 'search', `searchPatientDOM started: "${cleanName}"`, {
     original_name: name,
@@ -396,7 +457,9 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
     dob: dob || 'none',
     todayOnly,
     url: window.location.href,
+    ..._searchVis0,
   });
+  probeTimerLatency('searchPatientDOM', { patient: cleanName });
 
   // ── Find search input ──
   const searchInput = findSearchInput();
@@ -508,11 +571,17 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
     }, { timeout: 25000, interval: 500, desc: 'search results' });
   } catch {
     log('No results within 25s');
+    const _visEnd = visSnapshot();
     debugLog('content', 'warn', 'search', `No results within 25s (polled ${pollAttempt} times)`, {
       patient: cleanName,
       todayOnly,
       final_rows: parseStudyTable().length,
       final_row_names: parseStudyTable().slice(0, 5).map(r => r.patientName),
+      elapsed_ms: Math.round(performance.now() - _searchT0),
+      visibility_at_start: _searchVis0.visibility,
+      visibility_at_end: _visEnd.visibility,
+      visibility_changes_during: _visEnd.visibility_changes - _searchVis0.visibility_changes,
+      hidden_ms_during: _visEnd.cumulative_hidden_ms - _searchVis0.cumulative_hidden_ms,
     });
     return { studies: [], patientNamesFound: [] };
   }
@@ -627,6 +696,16 @@ async function searchPatientDOM(name, dob, debug = false, todayOnly = false) {
 
   const patientNamesFound = [...new Set(result.map(s => s.patientName).filter(Boolean))];
   log(`Done: ${result.length} studies, patients: ${patientNamesFound.join(', ')}`);
+  const _visEnd = visSnapshot();
+  debugLog('content', 'pass', 'search', `searchPatientDOM done: ${result.length} studies in ${Math.round(performance.now() - _searchT0)}ms`, {
+    patient: cleanName,
+    studies_returned: result.length,
+    elapsed_ms: Math.round(performance.now() - _searchT0),
+    visibility_at_start: _searchVis0.visibility,
+    visibility_at_end: _visEnd.visibility,
+    visibility_changes_during: _visEnd.visibility_changes - _searchVis0.visibility_changes,
+    hidden_ms_during: _visEnd.cumulative_hidden_ms - _searchVis0.cumulative_hidden_ms,
+  });
   return { studies: result, patientNamesFound };
 }
 
@@ -772,11 +851,16 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
   let resolvedStudyDate = studyDate || '';
   let resolvedLocation  = studyLocation || '';
 
+  const _bpT0 = performance.now();
+  const _bpVis0 = visSnapshot();
   debugLog('content', 'start', 'batch-preload', `batchPreloadStudy: "${studyDescription}" (${series.length} series)`, {
     patient: patient.name, patient_key: patientKey, study_uid: studyUid, modality, series_count: series.length,
+    ..._bpVis0,
   });
+  probeTimerLatency('batchPreloadStudy', { patient: patient.name, study: studyDescription });
 
   // ── Step 1: ViewPatInfo for all series, 3 at a time ──
+  const _viewT0 = performance.now();
   const viewTasks = series.map(s => async () => {
     try {
       const result = await getStudyImages(studyUid, s.seriesUid);
@@ -789,6 +873,7 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
   });
 
   const seriesResults = await pLimit(viewTasks, 3);
+  const _viewMs = Math.round(performance.now() - _viewT0);
 
   const seriesSummary = seriesResults.map(sr => ({
     series_desc: sr?.series?.description || '?',
@@ -796,8 +881,10 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
     error: sr?.error || null,
   }));
   const totalUrls = seriesSummary.reduce((a, s) => a + s.url_count, 0);
-  debugLog('content', totalUrls > 0 ? 'pass' : 'error', 'batch-preload', `ViewPatInfo done: ${totalUrls} total URLs across ${series.length} series`, {
+  debugLog('content', totalUrls > 0 ? 'pass' : 'error', 'batch-preload', `ViewPatInfo done: ${totalUrls} total URLs across ${series.length} series in ${_viewMs}ms`, {
     patient: patient.name, patient_key: patientKey, study: studyDescription, per_series: seriesSummary,
+    viewpatinfo_ms: _viewMs,
+    ...visSnapshot(),
   });
 
   // ── Step 1b: Fetch institution name from first available image (all modalities) ──
@@ -918,7 +1005,9 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
   }
 
   // ── Step 3: Download + upload all images, 4 at a time ──
+  const _dlT0 = performance.now();
   const downloadResults = await pLimit(downloadTasks, 4);
+  const _dlMs = Math.round(performance.now() - _dlT0);
   const count = downloadResults.reduce((a, b) => a + (b?.ok || 0), 0);
   const failures = downloadResults.filter(r => !r?.ok);
   const failReasons = {};
@@ -927,12 +1016,23 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
     failReasons[k] = (failReasons[k] || 0) + 1;
   }
 
+  const _bpVisEnd = visSnapshot();
+  const _bpTotalMs = Math.round(performance.now() - _bpT0);
+  const _msPerImage = count > 0 ? Math.round(_dlMs / count) : null;
   console.log(`[PACS-DOM] batchPreloadStudy "${studyDescription}": ${count}/${downloadTasks.length} images`);
-  debugLog('content', count > 0 ? 'pass' : 'error', 'batch-preload', `batchPreloadStudy done: ${count}/${downloadTasks.length} images uploaded`, {
+  debugLog('content', count > 0 ? 'pass' : 'error', 'batch-preload', `batchPreloadStudy done: ${count}/${downloadTasks.length} images in ${_bpTotalMs}ms (${_msPerImage}ms/img)`, {
     patient: patient.name, patient_key: patientKey, study: studyDescription,
     attempted: downloadTasks.length, succeeded: count, failed: downloadTasks.length - count,
     failure_reasons: failReasons,
     sample_failure: failures.find(f => f?.body) || failures[0] || null,
+    total_ms: _bpTotalMs,
+    viewpatinfo_ms: _viewMs,
+    download_ms: _dlMs,
+    ms_per_image: _msPerImage,
+    visibility_at_start: _bpVis0.visibility,
+    visibility_at_end: _bpVisEnd.visibility,
+    visibility_changes_during: _bpVisEnd.visibility_changes - _bpVis0.visibility_changes,
+    hidden_ms_during: _bpVisEnd.cumulative_hidden_ms - _bpVis0.cumulative_hidden_ms,
   });
   return { count, studyDate: resolvedStudyDate };
 }
@@ -941,7 +1041,7 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
 // IMAGE RETRIEVAL (ViewPatInfo)  — identical to original
 // ══════════════════════════════════════════════════════════════════════
 
-async function getStudyImages(studyUid, seriesUid, _retryOn401 = true) {
+async function getStudyImages(studyUid, seriesUid, _retryOn401 = true, _retryOnEmpty = true) {
   const session = getSessionParams();
   console.log(`[PACS-DOM] ViewPatInfo: study=...${studyUid.slice(-12)} series=...${seriesUid.slice(-12)}`);
 
@@ -952,6 +1052,7 @@ async function getStudyImages(studyUid, seriesUid, _retryOn401 = true) {
   let curpos = 1;
   let studyDate = '';
   let location  = '';
+  let discoveredHost = '';
 
   while (true) {
     const formData = new URLSearchParams();
@@ -987,6 +1088,7 @@ async function getStudyImages(studyUid, seriesUid, _retryOn401 = true) {
         const hostMatch = html.match(/name="SessionHost"\s+value="([^"]+)"/i);
         if (hostMatch?.[1]) {
           window.__pacsSessionHost = hostMatch[1];
+          discoveredHost = hostMatch[1];
           console.log('[PACS-DOM] SessionHost:', hostMatch[1]);
         }
         if (!studyDate) {
@@ -1005,7 +1107,15 @@ async function getStudyImages(studyUid, seriesUid, _retryOn401 = true) {
 
       const pageUrls = extractImageUrls(html);
       console.log(`[PACS-DOM] curpos=${curpos}: ${pageUrls.length} URL(s)`);
-      if (pageUrls.length === 0) break;
+      if (pageUrls.length === 0) {
+        // Cold-start race: first call used xmppDomain because no SessionHost was cached yet,
+        // server returned 0 images but taught us the real SessionHost. Retry once with it.
+        if (curpos === 1 && _retryOnEmpty && discoveredHost && discoveredHost !== sessionHost) {
+          try { debugLog('content', 'warn', 'batch-preload', 'ViewPatInfo returned 0 URLs with stale host — retrying with discovered SessionHost', { study_uid: studyUid, series_uid: seriesUid, used_host: sessionHost, discovered_host: discoveredHost }); } catch {}
+          return await getStudyImages(studyUid, seriesUid, _retryOn401, false);
+        }
+        break;
+      }
 
       const prevSize = allUrls.size;
       for (const url of pageUrls) allUrls.add(url);
@@ -1241,6 +1351,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'ping': {
       const session = getSessionParams();
       sendResponse({ ok: true, session, hasSession: !!(session.SID && session.UserName) });
+      return false;
+    }
+
+    case 'probeSearchInput': {
+      sendResponse({ ready: !!findSearchInput() });
       return false;
     }
   }

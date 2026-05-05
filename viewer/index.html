@@ -850,7 +850,8 @@
         if (!pendingRefreshKeys.has(key)) pendingRefreshKeys.set(key, Date.now());
         const status = (typeof meta === 'object' && meta.status) ? meta.status : 'queued';
         const detail = (typeof meta === 'object' && meta.detail) ? meta.detail : '';
-        pendingRefreshStatus.set(key, { status, detail });
+        const attempts = (typeof meta === 'object' && Array.isArray(meta.attempts)) ? meta.attempts : [];
+        pendingRefreshStatus.set(key, { status, detail, attempts });
       }
 
       // Keys the extension has finished: clear spinner + show result + reload if open
@@ -953,7 +954,7 @@
         const isPending = pendingRefreshKeys.has(p.key);
         const pendingAge = isPending ? formatRefreshAge(pendingRefreshKeys.get(p.key)) : '';
         const refreshInfo = pendingRefreshStatus.get(p.key);
-        const statusLabel = refreshInfo ? formatRefreshStatusLabel(refreshInfo.status, refreshInfo.detail) : '';
+        const statusLabel = refreshInfo ? formatRefreshStatusLabel(refreshInfo) : '';
         const statusClass = refreshInfo ? `status-${refreshInfo.status}` : '';
         const lastRefresh = !isPending && p.last_refresh ? p.last_refresh : null;
         const lastRefreshHtml = lastRefresh
@@ -1121,12 +1122,16 @@
     return `pending ${min}m ago`;
   }
 
-  function formatRefreshStatusLabel(status, detail) {
+  function formatRefreshStatusLabel(info) {
+    if (!info) return '';
+    const { status, detail, attempts } = info;
+    const usedFallback = Array.isArray(attempts) && attempts.length > 1;
+    const altName = usedFallback ? attempts[attempts.length - 1] : '';
     switch (status) {
       case 'queued':      return '↻ Waiting in queue';
-      case 'searching':   return '↻ Searching PACS...';
-      case 'downloading': return '↻ Downloading images...';
-      case 'no_results':  return '⚠ No images found';
+      case 'searching':   return usedFallback ? `↻ Trying alt: ${altName}...` : '↻ Searching PACS...';
+      case 'downloading': return usedFallback ? `↻ Downloading (via ${altName})...` : '↻ Downloading images...';
+      case 'no_results':  return usedFallback ? `⚠ No images · tried: ${attempts.join(' + ')}` : '⚠ No images found';
       case 'error':       return '✗ Error: ' + (detail || 'unknown');
       default:            return '↻ ' + (status || 'pending');
     }
@@ -1134,11 +1139,19 @@
 
   function formatLastRefresh(lr) {
     const time = lr.at || '';
+    const attempts = Array.isArray(lr.attempts) ? lr.attempts : [];
+    const usedFallback = attempts.length > 1;
+    const altName = usedFallback ? attempts[attempts.length - 1] : '';
     if (lr.status === 'downloading' || lr.status === 'completed' || !lr.status) {
       const count = lr.detail || '';
+      if (usedFallback) {
+        return count ? `✓ Found via "${altName}" — ${count} at ${time}` : `✓ Found via "${altName}" at ${time}`;
+      }
       return count ? `✓ Downloaded ${count} at ${time}` : `✓ Last checked ${time}`;
     }
-    if (lr.status === 'no_results') return `⚠ No images found at ${time}`;
+    if (lr.status === 'no_results') {
+      return usedFallback ? `⚠ No images (tried: ${attempts.join(' + ')}) at ${time}` : `⚠ No images found at ${time}`;
+    }
     if (lr.status === 'error') return `✗ Error at ${time}`;
     return `✓ Last checked ${time}`;
   }

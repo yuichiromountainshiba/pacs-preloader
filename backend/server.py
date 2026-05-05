@@ -594,6 +594,8 @@ async def update_refresh_status(patient_key: str, request: Request):
         entry["status"] = body.get("status", entry.get("status", "queued"))
         if "detail" in body:
             entry["detail"] = body["detail"]
+        if "attempts" in body and isinstance(body["attempts"], list):
+            entry["attempts"] = body["attempts"]
     return {"status": "updated"}
 
 
@@ -610,6 +612,7 @@ def clear_refresh(patient_key: str):
             "at": datetime.now().strftime("%#I:%M %p"),
             "status": entry.get("status", "completed"),
             "detail": entry.get("detail", ""),
+            "attempts": entry.get("attempts", []),
         }
     save_index(index)
     _dirty_count = 0
