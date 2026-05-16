@@ -847,7 +847,7 @@ async function pLimit(tasks, concurrency) {
  *
  * Called via the 'batchPreloadStudy' message from popup.js.
  */
-async function batchPreloadStudy({ studyUid, series, patient, studyDescription, studyDate, modality, location: studyLocation, serverUrl, clinicDate, patientKey }) {
+async function batchPreloadStudy({ studyUid, series, patient, studyDescription, studyDate, modality, location: studyLocation, serverUrl, clinicDate, patientKey, source, mrn, procedure }) {
   let resolvedStudyDate = studyDate || '';
   let resolvedLocation  = studyLocation || '';
 
@@ -969,6 +969,9 @@ async function batchPreloadStudy({ studyUid, series, patient, studyDescription, 
           fd.append('clinic_date',       clinicDate || '');
           fd.append('image_uid',         imageUid);
           if (patientKey) fd.append('patient_key', patientKey);
+          if (source)     fd.append('source',     source);
+          if (mrn)        fd.append('mrn',        mrn);
+          if (procedure)  fd.append('procedure',  procedure);
 
           const meta = metadataMap[url];
           if (meta?.sliceLocation != null && isFinite(meta.sliceLocation)) {

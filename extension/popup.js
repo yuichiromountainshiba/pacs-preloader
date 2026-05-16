@@ -2,17 +2,35 @@
 
 const $ = (sel) => document.querySelector(sel);
 
+// Surface any uncaught error / rejection in the popup itself so we don't have
+// to ask the user to open DevTools to debug a silently-broken init.
+function showPopupErr(text) {
+  try {
+    const el = document.getElementById('errBanner');
+    if (!el) return;
+    el.style.display = 'block';
+    el.textContent = (el.textContent ? el.textContent + '\n' : '') + text;
+  } catch {}
+}
+window.addEventListener('error', e =>
+  showPopupErr('JS error: ' + e.message + ' (' + (e.filename || '?') + ':' + (e.lineno || '?') + ')'));
+window.addEventListener('unhandledrejection', e =>
+  showPopupErr('Unhandled rejection: ' + (e.reason && (e.reason.stack || e.reason.message || e.reason) || e.reason)));
+
 let pacsTabId = null;
 let isPreloading = false;
 let ocrDropActive = false;
 
-let parsedPdfPatients = [];
-let pdfProviders = [];
-const selectedProviders = new Set();
-
 let ocrParsedPatients = [];
 let ocrProviders = [];
 const ocrSelectedProviders = new Set();
+
+// Which import tab is active — drives where Ctrl+V dispatches the pasted image.
+let activeImportTab = 'ocr';   // 'ocr' | 'pendingEpic' | 'pendingEmail'
+
+// Last parsed rows per pending tab — captured by the render fn so the Load button can post them.
+let pendingEpicRows = [];
+let pendingEmailRows = [];
 
 const FILTER_KEYS = SUBSPECIALTY.regionCheckboxes.map(cb => cb.id);
 const STORAGE_KEYS = ['schedule', 'serverUrl', 'clinicDate', ...FILTER_KEYS];
@@ -26,8 +44,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     $('#pacsStatusText').textContent = 'Connected to InteleBrowser';
     $('#preloadBtn').disabled = false;
 
+    // Timeout the ping. If the content script is wedged or hasn't loaded yet,
+    // chrome.tabs.sendMessage's callback may never fire — and a bare await
+    // would hang the rest of init, leaving every button below unresponsive.
     try {
-      const ping = await sendToTab(pacsTabId, 'ping', {});
+      const ping = await Promise.race([
+        sendToTab(pacsTabId, 'ping', {}),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ping timeout')), 1500)),
+      ]);
       if (ping.hasSession) {
         $('#pacsStatusText').textContent = `Connected — session active (${ping.session.UserName || 'unknown user'})`;
       } else {
@@ -70,9 +94,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('#clearBtn').addEventListener('click', clearCache);
   $('#viewerBtn').addEventListener('click', openViewer);
 
-  // Check if background is already preloading (popup may have been reopened mid-run)
+  // Check if background is already preloading (popup may have been reopened mid-run).
+  // Timeout-guarded — the background service worker can be sleeping and the
+  // sendMessage Promise sometimes never resolves, which would hang the rest of init.
   try {
-    const status = await chrome.runtime.sendMessage({ action: 'getStatus' });
+    const status = await Promise.race([
+      chrome.runtime.sendMessage({ action: 'getStatus' }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('getStatus timeout')), 1500)),
+    ]);
     if (status?.isPreloading) {
       isPreloading = true;
       $('#preloadBtn').disabled = true;
@@ -81,13 +110,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       $('#log').style.display = 'block';
       log('Preload running in background — open viewer anytime', 'info');
     }
-  } catch (e) { /* background not ready yet */ }
+  } catch (e) { /* background not ready yet / timed out — non-fatal */ }
 
   // Listen for progress updates from background
   chrome.runtime.onMessage.addListener(handleBackgroundMessage);
 
-  initOcr();
-  initPdf();
+  // Each init in its own try so one broken init doesn't cascade and disable
+  // the others' click handlers. Show any failure in the on-screen err banner.
+  try { initOcr(); }          catch (e) { showPopupErr('initOcr failed: ' + e.message); }
+  try { initPendingEpic(); }  catch (e) { showPopupErr('initPendingEpic failed: ' + e.message); }
+  try { initPendingEmail(); } catch (e) { showPopupErr('initPendingEmail failed: ' + e.message); }
 });
 
 function handleBackgroundMessage(msg) {
@@ -289,10 +321,11 @@ function initOcr() {
       document.getElementById('ocrProviderDropdown').style.display = 'none';
   });
 
-  document.addEventListener('paste', handleOcrPaste);
+  document.addEventListener('paste', handleImagePaste);
 }
 
-function handleOcrPaste(e) {
+// Single paste handler for all three import tabs — dispatches by activeImportTab.
+function handleImagePaste(e) {
   const items = [...(e.clipboardData?.items || [])];
   const imageItem = items.find(item => item.type.startsWith('image/'));
   if (!imageItem) return;
@@ -300,14 +333,19 @@ function handleOcrPaste(e) {
 
   e.preventDefault();
   const blob = imageItem.getAsFile();
-  const url = URL.createObjectURL(blob);
 
+  if (activeImportTab === 'ocr')          handleClinicOcrPaste(blob);
+  else if (activeImportTab === 'pendingEpic')  handlePendingEpicPaste(blob);
+  else if (activeImportTab === 'pendingEmail') handlePendingEmailPaste(blob);
+}
+
+function handleClinicOcrPaste(blob) {
+  const url = URL.createObjectURL(blob);
   document.getElementById('ocrImg').src = url;
   document.getElementById('ocrPreview').style.display = 'flex';
   document.getElementById('ocrDrop').style.display = 'none';
   document.getElementById('ocrStatus').textContent = 'Running OCR…';
   document.getElementById('ocrResult').value = '';
-
   runOcr(blob);
 }
 
@@ -461,148 +499,238 @@ function updateOcrTextarea() {
 }
 
 
-// ── PDF Schedule Upload ──
+// ── Import tab switching ──
 
 function switchImportTab(tab) {
-  document.getElementById('pdfPanel').style.display = tab === 'pdf' ? '' : 'none';
-  document.getElementById('ocrPanel').style.display = tab === 'ocr' ? '' : 'none';
-  document.getElementById('tabPdf').classList.toggle('active', tab === 'pdf');
-  document.getElementById('tabOcr').classList.toggle('active', tab === 'ocr');
+  activeImportTab = tab;
+  document.getElementById('ocrPanel').style.display          = tab === 'ocr'          ? '' : 'none';
+  document.getElementById('pendingEpicPanel').style.display  = tab === 'pendingEpic'  ? '' : 'none';
+  document.getElementById('pendingEmailPanel').style.display = tab === 'pendingEmail' ? '' : 'none';
+  document.getElementById('tabOcr').classList.toggle('active',          tab === 'ocr');
+  document.getElementById('tabPendingEpic').classList.toggle('active',  tab === 'pendingEpic');
+  document.getElementById('tabPendingEmail').classList.toggle('active', tab === 'pendingEmail');
 }
 
-function initPdf() {
-  document.getElementById('pdfFile').addEventListener('change', handlePdfUpload);
-  document.getElementById('pdfApplyBtn').addEventListener('click', applyPdfResult);
-  document.getElementById('pdfClearBtn').addEventListener('click', clearPdf);
-  document.getElementById('tabPdf').addEventListener('click', () => switchImportTab('pdf'));
-  document.getElementById('tabOcr').addEventListener('click', () => switchImportTab('ocr'));
-  document.getElementById('providerDropdownBtn').addEventListener('click', toggleProviderDropdown);
 
-  // Event delegation for provider dropdown (avoids inline handlers blocked by CSP)
-  const dd = document.getElementById('providerDropdown');
-  dd.addEventListener('click', e => {
-    const a = e.target.closest('[data-select-all]');
-    if (a) setAllProviders(a.dataset.selectAll === 'true');
-  });
-  dd.addEventListener('change', e => {
-    const cb = e.target.closest('input[type=checkbox]');
-    if (cb) toggleProvider(cb.value, cb.checked);
-  });
+// ── Pending Reads: Epic screenshot (preview only) ──
 
-  document.addEventListener('click', e => {
-    if (!e.target.closest('#providerFilterRow'))
-      document.getElementById('providerDropdown').style.display = 'none';
+function initPendingEpic() {
+  document.getElementById('tabOcr').addEventListener('click',          () => switchImportTab('ocr'));
+  document.getElementById('tabPendingEpic').addEventListener('click',  () => switchImportTab('pendingEpic'));
+  document.getElementById('tabPendingEmail').addEventListener('click', () => switchImportTab('pendingEmail'));
+
+  const drop = document.getElementById('pendingEpicDrop');
+  drop.addEventListener('click', () => { drop.focus(); drop.classList.add('active'); });
+  drop.addEventListener('blur',  () => drop.classList.remove('active'));
+  document.getElementById('pendingEpicClearBtn').addEventListener('click', clearPendingEpic);
+  document.getElementById('pendingEpicLoadBtn').addEventListener('click',
+    () => loadPendingToViewer(pendingEpicRows, 'epic', 'pendingEpic'));
+}
+
+function handlePendingEpicPaste(blob) {
+  const url = URL.createObjectURL(blob);
+  document.getElementById('pendingEpicImg').src = url;
+  document.getElementById('pendingEpicPreview').style.display = 'flex';
+  document.getElementById('pendingEpicDrop').style.display = 'none';
+  document.getElementById('pendingEpicStatus').textContent = 'Running OCR…';
+  document.getElementById('pendingEpicRows').innerHTML = '';
+  runPendingOcr(blob, '/api/ocr/pending-reads', 'pendingEpic', renderPendingEpicRows);
+}
+
+function renderPendingEpicRows(rows) {
+  pendingEpicRows = rows;
+  const container = document.getElementById('pendingEpicRows');
+  if (!rows.length) {
+    container.innerHTML =
+      '<div class="ocr-status">No rows parsed — expand server response in DevTools to diagnose.</div>';
+    return;
+  }
+  // Editable cells use contenteditable + data-row/data-field; a delegated
+  // blur handler writes the new text back to pendingEpicRows[row][field]
+  // so the next "Load to Pending Viewer" picks up the user's corrections.
+  const ed = (i, field, value) =>
+    `<td contenteditable="true" data-row="${i}" data-field="${field}">${escHtml(value)}</td>`;
+  const html = `<div class="ocr-status" style="font-size:10px;color:#475569;margin:2px 0">click any cell to edit</div>
+    <table class="pending-table"><thead><tr>
+      <th>#</th><th>Name</th><th>DOB</th><th>Study</th><th>Date</th><th>Time</th><th>Flags</th>
+    </tr></thead><tbody>` + rows.map((r, i) => `
+      <tr class="${(r.flags || []).length ? 'flagged' : ''}">
+        <td>${i + 1}</td>
+        ${ed(i, 'name', r.name || '')}
+        ${ed(i, 'dob', r.dob || '')}
+        ${ed(i, 'study_description', r.study_description || '')}
+        ${ed(i, 'study_date', r.study_date || '')}
+        ${ed(i, 'study_time', r.study_time || '')}
+        <td>${(r.flags || []).map(f => `<span class="pending-flag">${escHtml(f)}</span>`).join('')}</td>
+      </tr>`).join('') + `</tbody></table>`;
+  container.innerHTML = html;
+  wirePendingEdits(container, pendingEpicRows);
+}
+
+function clearPendingEpic() {
+  pendingEpicRows = [];
+  document.getElementById('pendingEpicPreview').style.display = 'none';
+  document.getElementById('pendingEpicDrop').style.display = 'block';
+  document.getElementById('pendingEpicRows').innerHTML = '';
+  document.getElementById('pendingEpicStatus').textContent = '';
+  document.getElementById('pendingEpicImg').src = '';
+}
+
+
+// ── Pending Reads: Email reminder (preview only) ──
+
+function initPendingEmail() {
+  const drop = document.getElementById('pendingEmailDrop');
+  drop.addEventListener('click', () => { drop.focus(); drop.classList.add('active'); });
+  drop.addEventListener('blur',  () => drop.classList.remove('active'));
+  document.getElementById('pendingEmailClearBtn').addEventListener('click', clearPendingEmail);
+  document.getElementById('pendingEmailLoadBtn').addEventListener('click',
+    () => loadPendingToViewer(pendingEmailRows, 'email', 'pendingEmail'));
+}
+
+function handlePendingEmailPaste(blob) {
+  const url = URL.createObjectURL(blob);
+  document.getElementById('pendingEmailImg').src = url;
+  document.getElementById('pendingEmailPreview').style.display = 'flex';
+  document.getElementById('pendingEmailDrop').style.display = 'none';
+  document.getElementById('pendingEmailStatus').textContent = 'Running OCR…';
+  document.getElementById('pendingEmailRows').innerHTML = '';
+  runPendingOcr(blob, '/api/ocr/pending-reads-email', 'pendingEmail', renderPendingEmailRows);
+}
+
+function renderPendingEmailRows(rows) {
+  pendingEmailRows = rows;
+  const container = document.getElementById('pendingEmailRows');
+  if (!rows.length) {
+    container.innerHTML =
+      '<div class="ocr-status">No rows parsed — expand server response in DevTools to diagnose.</div>';
+    return;
+  }
+  const ed = (i, field, value) =>
+    `<td contenteditable="true" data-row="${i}" data-field="${field}">${escHtml(value)}</td>`;
+  const html = `<div class="ocr-status" style="font-size:10px;color:#475569;margin:2px 0">click any cell to edit</div>
+    <table class="pending-table"><thead><tr>
+      <th>#</th><th>Name</th><th>MRN</th><th>Appt date</th><th>Time</th><th>Procedure</th><th>Flags</th>
+    </tr></thead><tbody>` + rows.map((r, i) => `
+      <tr class="${(r.flags || []).length ? 'flagged' : ''}">
+        <td>${i + 1}</td>
+        ${ed(i, 'name', r.name || '')}
+        ${ed(i, 'mrn', r.mrn || '')}
+        ${ed(i, 'appt_date', r.appt_date || '')}
+        ${ed(i, 'appt_time', r.appt_time || '')}
+        ${ed(i, 'procedure', r.procedure || '')}
+        <td>${(r.flags || []).map(f => `<span class="pending-flag">${escHtml(f)}</span>`).join('')}</td>
+      </tr>`).join('') + `</tbody></table>`;
+  container.innerHTML = html;
+  wirePendingEdits(container, pendingEmailRows);
+}
+
+
+// Delegated edit binding for pending preview tables. Writes blur-time text back
+// to the underlying row array so the popup-resident state stays in sync with
+// what the user sees.
+function wirePendingEdits(container, rows) {
+  container.addEventListener('blur', e => {
+    const td = e.target.closest('td[contenteditable]');
+    if (!td) return;
+    const i = parseInt(td.dataset.row, 10);
+    const field = td.dataset.field;
+    if (isNaN(i) || !field || !rows[i]) return;
+    rows[i][field] = td.textContent.trim();
+  }, true);  // capture phase — blur doesn't bubble
+  // Enter commits the edit (don't insert a newline in the cell)
+  container.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.target.matches('td[contenteditable]')) {
+      e.preventDefault();
+      e.target.blur();
+    }
   });
 }
 
-async function handlePdfUpload(e) {
-  const file = e.target.files[0];
-  if (!file) return;
+function clearPendingEmail() {
+  pendingEmailRows = [];
+  document.getElementById('pendingEmailPreview').style.display = 'none';
+  document.getElementById('pendingEmailDrop').style.display = 'block';
+  document.getElementById('pendingEmailRows').innerHTML = '';
+  document.getElementById('pendingEmailStatus').textContent = '';
+  document.getElementById('pendingEmailImg').src = '';
+}
+
+
+// Kick off real PACS search + preload for the parsed pending rows, then open
+// the existing viewer in pending mode so the user can swipe through images
+// as they arrive.
+async function loadPendingToViewer(rows, sourceLabel, panelId) {
   const serverUrl = $('#serverUrl').value.replace(/\/$/, '');
-  const statusEl = document.getElementById('pdfStatus');
-  statusEl.textContent = 'Parsing PDF…';
-  document.getElementById('pdfBtns').style.display = 'none';
-  document.getElementById('providerFilterRow').style.display = 'none';
+  const statusEl = document.getElementById(panelId + 'Status');
+  if (!rows || !rows.length) {
+    statusEl.textContent = 'Nothing to load — paste a screenshot first.';
+    return;
+  }
+  // Re-verify the cached pacsTabId is still alive (user may have closed PACS
+  // since opening the popup). Fall back to any open pacs.renoortho.com tab.
+  let livePacsTabId = null;
+  if (pacsTabId) {
+    try {
+      const t = await chrome.tabs.get(pacsTabId);
+      if (t && t.url && t.url.includes('pacs.renoortho.com')) livePacsTabId = pacsTabId;
+    } catch (e) { /* tab gone */ }
+  }
+  if (!livePacsTabId) {
+    const tabs = await chrome.tabs.query({ url: 'https://pacs.renoortho.com/*' });
+    if (tabs && tabs.length) livePacsTabId = tabs[0].id;
+  }
+  if (!livePacsTabId) {
+    statusEl.textContent = '✗ No PACS tab open — open InteleBrowser in another tab first.';
+    return;
+  }
 
-  const form = new FormData();
-  form.append('file', file);
+  // Health-check the server up front so the user gets a useful error if it's not running.
   try {
-    const resp = await fetch(`${serverUrl}/api/parse-pdf`, { method: 'POST', body: form });
+    const resp = await fetch(`${serverUrl}/api/health`);
+    if (!resp.ok) throw new Error();
+  } catch (e) {
+    statusEl.textContent = '✗ Local server not running — start: python backend/server.py';
+    return;
+  }
+
+  const source = `pending_${sourceLabel}`;   // 'pending_epic' | 'pending_email'
+  statusEl.textContent = `Queued ${rows.length} row(s) — preload running. Opening viewer (status shows there)…`;
+
+  chrome.runtime.sendMessage({
+    action:   'startPendingPreload',
+    rows,
+    source,
+    serverUrl,
+    tabId:    livePacsTabId,
+  });
+  chrome.tabs.create({ url: `${serverUrl}/viewer?mode=pending` });
+}
+
+
+// Shared OCR caller for both pending-reads endpoints.
+async function runPendingOcr(blob, endpoint, panelId, renderRows) {
+  const serverUrl = $('#serverUrl').value.replace(/\/$/, '');
+  const statusEl = document.getElementById(panelId + 'Status');
+  try {
+    const form = new FormData();
+    form.append('image', blob, 'pending.png');
+    const resp = await fetch(`${serverUrl}${endpoint}`, { method: 'POST', body: form });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-      statusEl.textContent = `Error: ${err.detail}`;
+      statusEl.textContent = `OCR error: ${err.detail}`;
       return;
     }
     const data = await resp.json();
-    parsedPdfPatients = data.patients;
-    pdfProviders = data.providers;
-    selectedProviders.clear();
-    pdfProviders.forEach(p => selectedProviders.add(p));
-
-    const n = data.count;
-    statusEl.textContent = `Found ${n} patient${n !== 1 ? 's' : ''} · ${pdfProviders.length} provider${pdfProviders.length !== 1 ? 's' : ''}`;
-    if (pdfProviders.length > 1) {
-      buildProviderDropdown();
-      document.getElementById('providerFilterRow').style.display = '';
-    }
-    document.getElementById('pdfBtns').style.display = 'flex';
-  } catch (err) {
-    statusEl.textContent = `Server error: ${err.message}`;
+    const n = data.count || 0;
+    const flagged = (data.rows || []).filter(r => (r.flags || []).length).length;
+    statusEl.textContent = `Found ${n} row${n !== 1 ? 's' : ''}` +
+      (flagged ? ` · ${flagged} flagged for review` : '') +
+      (data.debug?.skipped ? ` · ${data.debug.skipped} skipped` : '');
+    renderRows(data.rows || []);
+  } catch (e) {
+    statusEl.textContent = `Server error: ${e.message}`;
   }
-}
-
-function buildProviderDropdown() {
-  const dd = document.getElementById('providerDropdown');
-  dd.innerHTML = `<div class="provider-select-all">
-    <a data-select-all="true">All</a> · <a data-select-all="false">None</a>
-  </div>` + pdfProviders.map(p =>
-    `<label class="provider-option">
-      <input type="checkbox" value="${escHtml(p)}" ${selectedProviders.has(p) ? 'checked' : ''}>
-      ${escHtml(p)}
-    </label>`
-  ).join('');
-  updateProviderBtn();
-}
-
-function toggleProviderDropdown() {
-  const dd = document.getElementById('providerDropdown');
-  dd.style.display = dd.style.display === 'none' ? '' : 'none';
-}
-
-function toggleProvider(name, checked) {
-  if (checked) selectedProviders.add(name); else selectedProviders.delete(name);
-  updateProviderBtn();
-}
-
-function setAllProviders(checked) {
-  pdfProviders.forEach(p => checked ? selectedProviders.add(p) : selectedProviders.delete(p));
-  document.querySelectorAll('#providerDropdown input[type=checkbox]')
-    .forEach(cb => { cb.checked = checked; });
-  updateProviderBtn();
-}
-
-function updateProviderBtn() {
-  const n = selectedProviders.size, total = pdfProviders.length;
-  document.getElementById('providerDropdownBtn').textContent =
-    n === total ? `All providers (${total}) ▾` :
-    n === 0    ? 'No providers selected ▾' :
-                 `${n} of ${total} providers ▾`;
-}
-
-function applyPdfResult() {
-  const filtered = parsedPdfPatients
-    .filter(p => !p.provider || selectedProviders.has(p.provider))
-    .map(p => {
-      let line = '';
-      if (p.time) line += `${p.time}  `;
-      line += `${p.name}  ${p.dob}`;
-      if (p.provider) line += `  # ${p.provider}`;
-      return line;
-    });
-  if (!filtered.length) return;
-  const current = $('#schedule').value.trim();
-  $('#schedule').value = current ? `${current}\n${filtered.join('\n')}` : filtered.join('\n');
-  chrome.storage.local.set({ schedule: $('#schedule').value });
-  // Auto-fill clinic date if all patients share one date
-  const dates = [...new Set(parsedPdfPatients.map(p => p.clinic_date).filter(Boolean))];
-  if (dates.length === 1 && !$('#clinicDate').value) {
-    const iso = toInputDate(dates[0]);
-    if (iso) { $('#clinicDate').value = iso; chrome.storage.local.set({ clinicDate: iso }); }
-  }
-  document.getElementById('providerDropdown').style.display = 'none';
-}
-
-function clearPdf() {
-  parsedPdfPatients = []; pdfProviders = []; selectedProviders.clear();
-  document.getElementById('pdfStatus').textContent = '';
-  document.getElementById('pdfBtns').style.display = 'none';
-  document.getElementById('providerFilterRow').style.display = 'none';
-  document.getElementById('pdfFile').value = '';
-}
-
-function toInputDate(str) {
-  const m = str.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  return m ? `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}` : '';
 }
 
 function escHtml(s) {

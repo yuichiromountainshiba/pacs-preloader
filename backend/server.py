@@ -191,6 +191,372 @@ async def ocr_image(image: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/ocr/pending-reads")
+async def ocr_pending_reads(image: UploadFile = File(...)):
+    """OCR an Epic 'pending reads' screenshot (two-column layout) into structured rows.
+
+    Each source row is one patient + one study. Left column carries the patient
+    (name; 'AGE y.o. SEX (DOB)'; optional status line); right column carries the
+    study (description; 'DATE TIME - Last edited by TECH'; 'PROVIDER - Authorizing
+    provider'). Left-column entries anchor the rows; right-column lines are paired
+    to a row by vertical position so a dropped OCR line can't desync the columns.
+    """
+    try:
+        import pytesseract
+        from pytesseract import Output
+        from PIL import Image, ImageFilter, ImageOps
+        import io
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+        img = Image.open(io.BytesIO(await image.read())).convert('L')
+        w, h = img.size
+        img = img.resize((w * 2, h * 2), Image.LANCZOS)
+        img = ImageOps.autocontrast(img, cutoff=2)
+        img = img.filter(ImageFilter.SHARPEN)
+
+        data = pytesseract.image_to_data(img, config='--psm 6 --oem 1', output_type=Output.DICT)
+        rows, debug = _parse_pending_reads(data, img.size)
+        return {"status": "ok", "count": len(rows), "rows": rows, "debug": debug}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="pytesseract not installed. Run: pip install pytesseract pillow")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+_DATE_TIME_RE = re.compile(r'(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}:\d{2}\s*[AP]\.?M\.?)', re.I)
+
+
+def _parse_pending_reads(data, img_size):
+    """Turn pytesseract image_to_data output into pending-read rows.
+
+    Ignores Tesseract's own line grouping (PSM 6 merges across columns); instead
+    re-clusters raw word boxes by position. The left column (patient) clusters
+    cleanly into entries by vertical gaps; the right column (study) is anchored
+    on its date+time line — every study has exactly one — and the description is
+    the line(s) directly above it. Rows are paired by vertical order.
+    """
+    n = len(data['text'])
+    words = []
+    for i in range(n):
+        txt = (data['text'][i] or '').strip()
+        try:
+            conf = float(data['conf'][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if not txt or conf < 25:
+            continue
+        words.append({
+            'text': txt,
+            'conf': conf,
+            'left': data['left'][i],
+            'top': data['top'][i],
+            'width': data['width'][i],
+            'height': data['height'][i],
+            'cx': data['left'][i] + data['width'][i] / 2,
+        })
+    if not words:
+        return [], {'reason': 'no words detected'}
+
+    heights = sorted(w['height'] for w in words)
+    med_h = heights[len(heights) // 2] or 1
+
+    # ── Auto-detect the column gutter (largest horizontal gap in word centers) ──
+    centers = sorted(w['cx'] for w in words)
+    best_gap, split_x = 0, img_size[0] / 2
+    for a, b in zip(centers, centers[1:]):
+        if b - a > best_gap:
+            best_gap, split_x = b - a, (a + b) / 2
+    if best_gap < img_size[0] * 0.10:
+        split_x = img_size[0] / 2  # no clear gutter — fall back to the midline
+
+    left_words = [w for w in words if w['cx'] < split_x]
+    right_words = [w for w in words if w['cx'] >= split_x]
+
+    def group_lines(col_words):
+        """Cluster a column's words into text lines by vertical proximity."""
+        lines = []
+        for w in sorted(col_words, key=lambda w: w['top']):
+            if lines and abs(w['top'] - lines[-1]['top']) <= med_h * 0.6:
+                lines[-1]['words'].append(w)
+                lines[-1]['top'] = min(lines[-1]['top'], w['top'])
+            else:
+                lines.append({'top': w['top'], 'words': [w]})
+        for ln in lines:
+            ln['words'].sort(key=lambda w: w['left'])
+            ln['text'] = ' '.join(w['text'] for w in ln['words'])
+            ln['bottom'] = max(w['top'] + w['height'] for w in ln['words'])
+            ln['min_conf'] = min(w['conf'] for w in ln['words'])
+        return lines
+
+    left_lines = group_lines(left_words)
+    right_lines = group_lines(right_words)
+
+    # ── Cluster left-column lines into patient entries by vertical gaps ──
+    left_entries = []
+    for ln in left_lines:
+        if left_entries and ln['top'] - left_entries[-1]['lines'][-1]['bottom'] <= med_h * 1.2:
+            left_entries[-1]['lines'].append(ln)
+        else:
+            left_entries.append({'lines': [ln]})
+    for ent in left_entries:
+        ent['top'] = ent['lines'][0]['top']
+        ent['text'] = ' '.join(ln['text'] for ln in ent['lines'])
+        # The name is the first line of the entry — track its OCR confidence so
+        # the popup can highlight shaky reads for manual review before fetching.
+        ent['name_conf'] = round(ent['lines'][0]['min_conf'])
+
+    # ── Build right-column entries anchored on their date+time line ──
+    date_idxs = [i for i, ln in enumerate(right_lines) if _DATE_TIME_RE.search(ln['text'])]
+    right_entries = []
+    for k, di in enumerate(date_idxs):
+        prev_di = date_idxs[k - 1] if k > 0 else -1
+        next_di = date_idxs[k + 1] if k + 1 < len(date_idxs) else len(right_lines)
+        desc_parts = []
+        for j in range(prev_di + 1, di):
+            t = right_lines[j]['text'].strip()
+            if not t or re.fullmatch(r'[-–—\s]+', t):
+                continue
+            if re.search(r'authorizing provider', t, re.I):
+                continue
+            desc_parts.append(t)
+        provider_text = ''
+        for j in range(di + 1, next_di):
+            if re.search(r'authorizing provider', right_lines[j]['text'], re.I):
+                provider_text = right_lines[j]['text']
+                break
+        right_entries.append({
+            'top': right_lines[di]['top'],
+            'date_text': right_lines[di]['text'],
+            'description': ' '.join(desc_parts).strip(),
+            'provider_text': provider_text,
+        })
+
+    # ── Pair left ↔ right entries ──
+    rows = []
+    paired = list(zip(left_entries, right_entries))
+    # If counts differ, OCR dropped a line somewhere — pair what we can in order
+    # and leave the rest unmatched (they become unresolved rows downstream).
+    if len(left_entries) > len(right_entries):
+        paired += [(le, None) for le in left_entries[len(right_entries):]]
+    for le, re_ in paired:
+        parsed = _parse_pending_row(le['text'], re_, le.get('name_conf', 0))
+        if parsed:
+            rows.append(parsed)
+
+    return rows, {
+        'split_x': round(split_x), 'split_gap': round(best_gap),
+        'left_lines': len(left_lines), 'right_lines': len(right_lines),
+        'left_entries': len(left_entries), 'right_entries': len(right_entries),
+        'count_mismatch': len(left_entries) != len(right_entries),
+    }
+
+
+def _age_from_dob(dob_str):
+    """Return the age in whole years for a M/D/YYYY DOB as of today, or None."""
+    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', dob_str or '')
+    if not m:
+        return None
+    mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    today = datetime.now()
+    age = today.year - y - ((today.month, today.day) < (mo, d))
+    return age if 0 <= age <= 130 else None
+
+
+def _parse_pending_row(left_text, right, name_conf=0):
+    """Parse one row's left (patient) text + right (study) entry into a structured dict.
+
+    `right` is a dict {date_text, description, provider_text} or None (no study found
+    for this patient — still returns a row so it can show as unresolved in the viewer).
+    `name_conf` is the min OCR confidence of the name line.
+    Returns None only if a usable name + DOB can't be extracted.
+
+    Sets a `flags` list naming anything the user should eyeball before fetching —
+    the DOB filter in the search is a hard backstop against wrong-patient images,
+    so these flags exist mainly to catch a corrupted DOB or a mangled name that
+    would otherwise just silently fail to match.
+    """
+    left_text = re.sub(r'\s{2,}', ' ', left_text).strip()
+
+    # ── Left: name + age/sex + DOB ──  e.g. 'Petersen, Donald "Don" 74 y.o. male (2/15/1952)'
+    # Tolerate OCR reading 'y.o.' as 'y.0.' (zero for letter o).
+    age_match = re.search(r'(\d{1,3})\s*y\.?\s*[o0O]\.?\s*\.?\s*(male|female)?', left_text, re.I)
+    name_raw = left_text[:age_match.start()] if age_match else left_text
+    name_raw = re.sub(r'["“”\'`].*?["“”\'`]', '', name_raw)  # drop nickname in quotes
+    name = _clean_name(name_raw)
+    age = age_match.group(1) if age_match else ''
+    sex = (age_match.group(2) or '').lower() if (age_match and age_match.group(2)) else ''
+
+    dob = ''
+    dob_match = re.search(r'\(?\s*(\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})\s*\)?', left_text)
+    if dob_match:
+        dob = _normalise_date(re.sub(r'\s+', '', dob_match.group(1)))
+    else:
+        restored = _restore_dob_slashes(left_text)
+        m2 = re.search(r'\b(\d{1,2}/\d{1,2}/\d{4})\b', restored)
+        if m2:
+            dob = _normalise_date(m2.group(1))
+
+    if not name or not dob:
+        return None
+
+    # ── Right: study date/time + description + tech + provider ──
+    study_date, study_time, tech, provider, description = '', '', '', '', ''
+    if right:
+        description = re.sub(r'\s{2,}', ' ', right.get('description', '')).strip()
+        date_text = right.get('date_text', '')
+        dt_match = _DATE_TIME_RE.search(date_text)
+        if dt_match:
+            study_date = _normalise_date(dt_match.group(1))
+            study_time = re.sub(r'\s+', ' ', dt_match.group(2)).upper().replace('.', '').strip()
+        tech_match = re.search(r'last edited by\s+(.+)$', date_text, re.I)
+        if tech_match:
+            tech = tech_match.group(1).strip(' -–—')
+        prov_match = re.search(r'(.+?)\s*[-–—]?\s*authorizing provider',
+                               right.get('provider_text', ''), re.I)
+        if prov_match:
+            provider = prov_match.group(1).strip(' -–—')
+
+    # ── Flag anything worth a manual look before the fetch ──
+    flags = []
+    # 1. Age vs DOB — the strongest guard against a corrupted DOB.
+    expected_age = _age_from_dob(dob)
+    if age and expected_age is not None:
+        if abs(int(age) - expected_age) > 1:   # >1yr slack for birthday boundary
+            flags.append('age_dob_mismatch')
+    # 2. Name shape — a mangled name fails to match silently otherwise.
+    if ',' not in name:
+        flags.append('name_no_first')          # e.g. OCR dropped the first-name line
+    elif len(name.split(',', 1)[1].strip()) < 2:
+        flags.append('name_no_first')
+    if len(re.sub(r'[^A-Za-z]', '', name)) < 3:
+        flags.append('name_too_short')
+    if re.search(r'\d', name):
+        flags.append('name_has_digits')
+    # 3. Shaky OCR on the name line.
+    if name_conf and name_conf < 60:
+        flags.append('low_confidence')
+    # 4. No study matched on the right — becomes an unresolved row in the viewer.
+    if not study_date:
+        flags.append('no_study')
+
+    return {
+        'name': name, 'dob': dob, 'age': age, 'sex': sex,
+        'study_description': description, 'study_date': study_date,
+        'study_time': study_time, 'tech': tech, 'provider': provider,
+        'name_conf': name_conf, 'flags': flags,
+        'raw_left': left_text,
+    }
+
+
+# One full row of the pending-reads *email* table. Anchored on MRN-in-parens,
+# which is the only digit-only token on the line that can't collide with a date.
+_EMAIL_ROW_RE = re.compile(
+    r'^\W*'
+    r'(\d{1,2})/(\d{1,2})/(\d{4})'                          # appt date M/D/YYYY
+    r'(?:\s+(\d{1,2}:\d{2}))?'                              # optional H:MM (24h)
+    r'\s+(.+?,\s*(?:MD|DO|MBBS|NP|PA|RN|DPM|MBA))\s+'       # provider + credential
+    r'(.+?)'                                                # patient name (lazy)
+    r'\s*\((\d{4,10})\)\s+'                                 # MRN in parens
+    r'(.+?)\s*$'                                            # procedure to EOL
+)
+
+
+@app.post("/api/ocr/pending-reads-email")
+async def ocr_pending_reads_email(image: UploadFile = File(...)):
+    """OCR a pending-reads *email reminder* screenshot (4-column tabular layout).
+
+    Columns: Appt Date and Time | Authorizing Provider | Patient Name (MRN) | Procedure.
+    Each row is one patient + one *upcoming* appointment. Unlike the Epic pending-reads
+    screenshot, there is no DOB — MRN is the patient identifier and the date is the
+    appointment date (often future), not the study date.
+
+    PSM 4 (variable-width columns) is required here — the table borders defeat the
+    uniform-block PSM 6 used for the screenshot endpoint.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+        img = Image.open(io.BytesIO(await image.read()))
+        text = pytesseract.image_to_string(img, config='--psm 4 --oem 1')
+        rows, debug = _parse_pending_reads_email(text)
+        return {"status": "ok", "count": len(rows), "rows": rows, "debug": debug}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="pytesseract not installed. Run: pip install pytesseract pillow")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _parse_pending_reads_email(text):
+    """Parse OCR text of a pending-reads email into row dicts.
+
+    Each line is independent: `<date> <time?> <provider, MD> <name> (<MRN>) <procedure>`.
+    Lines that don't match (header, blank, garbled) are skipped and surfaced in debug.
+    """
+    rows = []
+    skipped = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = _EMAIL_ROW_RE.match(line)
+        if not m:
+            skipped.append(line[:80])
+            continue
+
+        month_str, day_str, year_str = m.group(1), m.group(2), m.group(3)
+        flags = []
+        # Table-border bleed sometimes doubles the leading digit ("4/" → "44/").
+        # Months > 12 are impossible — drop the spurious leading digit.
+        if int(month_str) > 12 and len(month_str) == 2:
+            month_str = month_str[-1]
+            flags.append('month_corrected')
+
+        appt_date = _normalise_date(f"{month_str}/{day_str}/{year_str}")
+        appt_time = (m.group(4) or '').strip()
+        provider = m.group(5).strip()
+        name_raw = m.group(6).strip()
+        mrn = m.group(7)
+        procedure = m.group(8).strip()
+
+        # Stray non-alpha prefix on the name (e.g. '�Ahumada' → 'Ahumada').
+        name_raw = re.sub(r'^[^A-Za-z]+', '', name_raw)
+        name = _clean_name(name_raw)
+        if not name:
+            skipped.append(line[:80])
+            continue
+
+        if not appt_time:
+            flags.append('time_missing')
+        if ',' not in name or len(name.split(',', 1)[1].strip()) < 2:
+            flags.append('name_no_first')
+        if len(re.sub(r'[^A-Za-z]', '', name)) < 3:
+            flags.append('name_too_short')
+        if re.search(r'\d', name):
+            flags.append('name_has_digits')
+        if len(mrn) < 5:
+            flags.append('mrn_short')
+
+        rows.append({
+            'name': name,
+            'mrn': mrn,
+            'appt_date': appt_date,
+            'appt_time': appt_time,
+            'provider': provider,
+            'procedure': procedure,
+            'flags': flags,
+            'raw_line': line,
+        })
+
+    return rows, {
+        'parsed': len(rows),
+        'skipped': len(skipped),
+        'skipped_samples': skipped[:5],
+    }
+
+
 @app.post("/api/schedule/import")
 async def import_schedule(req: dict = {}):
     """Accept a parsed schedule from epic_capture / nightly loader and register all patients."""
@@ -253,11 +619,24 @@ async def register_patient(
     clinic_time: str = Form(""),
     provider: str = Form(""),
     patient_key: str = Form(""),
+    source: str = Form(""),        # 'pending_epic' | 'pending_email' | ''=clinic
+    mrn: str = Form(""),
+    procedure: str = Form(""),
 ):
-    """Register a patient with no images yet (placeholder for pending preload)."""
+    """Register a patient with no images yet (placeholder for pending preload).
+
+    For pending-reads sources, the patient_key is prefixed `pr_` so pending and
+    clinic records for the same person never collide in the index.
+    """
     global _dirty_count
     index = _get_cached_index()
-    patient_key = patient_key.strip() or sanitize_filename(f"{patient_name}_{patient_dob}")
+    if not patient_key.strip():
+        # Email rows have no DOB; key on MRN instead so duplicates collapse.
+        base_id = patient_dob or mrn or ""
+        patient_key = sanitize_filename(f"{patient_name}_{base_id}")
+        if source.startswith("pending_"):
+            patient_key = f"pr_{patient_key}"
+    patient_key = patient_key.strip()
     if patient_key not in index["patients"]:
         index["patients"][patient_key] = {
             "name": patient_name,
@@ -265,6 +644,9 @@ async def register_patient(
             "clinic_date": clinic_date,
             "clinic_time": clinic_time,
             "provider": provider,
+            "source": source,
+            "mrn": mrn,
+            "procedure": procedure,
             "studies": {},
             "image_count": 0,
             "created_at": datetime.now().isoformat(),
@@ -282,6 +664,15 @@ async def register_patient(
             dirty = True
         if clinic_time:
             pt["clinic_time"] = clinic_time
+            dirty = True
+        if source and not pt.get("source"):
+            pt["source"] = source
+            dirty = True
+        if mrn and not pt.get("mrn"):
+            pt["mrn"] = mrn
+            dirty = True
+        if procedure and not pt.get("procedure"):
+            pt["procedure"] = procedure
             dirty = True
         if dirty:
             save_index(index)
@@ -311,6 +702,9 @@ async def receive_image(
     modality: str = Form(""),
     location: str = Form(""),
     patient_key: str = Form(""),
+    source: str = Form(""),
+    mrn: str = Form(""),
+    procedure: str = Form(""),
 ):
     """Receive an image from the Chrome extension and store it locally."""
 
@@ -321,6 +715,7 @@ async def receive_image(
             study_date, image_index, clinic_date, clinic_time, image_uid, slice_location,
             image_position, image_orientation, rows, cols, pixel_spacing, provider, modality, location,
             patient_key_override=patient_key.strip() if patient_key else "",
+            source=source, mrn=mrn, procedure=procedure,
         )
 
 
@@ -329,13 +724,21 @@ async def _receive_image_locked(
     study_date, image_index, clinic_date, clinic_time, image_uid, slice_location,
     image_position, image_orientation, rows, cols, pixel_spacing, provider, modality="", location="",
     patient_key_override="",
+    source="", mrn="", procedure="",
 ):
     global _dirty_count, _last_image_at
     import time
     _last_image_at = time.time()
     index = _get_cached_index()
-    # Create / update patient — use override key when provided (e.g. refresh after name edit)
-    patient_key = patient_key_override or sanitize_filename(f"{patient_name}_{patient_dob}")
+    # Create / update patient — use override key when provided (e.g. refresh after name edit).
+    # Pending-reads sources are prefixed pr_ so they never share storage with clinic records.
+    if patient_key_override:
+        patient_key = patient_key_override
+    else:
+        base_id = patient_dob or mrn or ""
+        patient_key = sanitize_filename(f"{patient_name}_{base_id}")
+        if source.startswith("pending_"):
+            patient_key = f"pr_{patient_key}"
     patient_dir = IMAGES_DIR / patient_key
     patient_dir.mkdir(parents=True, exist_ok=True)
     if patient_key not in index["patients"]:
@@ -345,6 +748,9 @@ async def _receive_image_locked(
             "clinic_date": clinic_date,
             "clinic_time": clinic_time,
             "provider": provider,
+            "source": source,
+            "mrn": mrn,
+            "procedure": procedure,
             "studies": {},
             "image_count": 0,
             "created_at": datetime.now().isoformat(),
@@ -357,6 +763,12 @@ async def _receive_image_locked(
             pt["clinic_time"] = clinic_time
         if provider and not pt.get("provider"):
             pt["provider"] = provider
+        if source and not pt.get("source"):
+            pt["source"] = source
+        if mrn and not pt.get("mrn"):
+            pt["mrn"] = mrn
+        if procedure and not pt.get("procedure"):
+            pt["procedure"] = procedure
 
     patient = index["patients"][patient_key]
     # Use study UID when available; fall back to description+date so studies from
@@ -460,6 +872,9 @@ def list_patients():
             "clinic_date": data.get("clinic_date", ""),
             "clinic_time": data.get("clinic_time", ""),
             "provider": data.get("provider", ""),
+            "source": data.get("source", ""),
+            "mrn": data.get("mrn", ""),
+            "procedure": data.get("procedure", ""),
             "image_count": data["image_count"],
             "study_count": len(data["studies"]),
             "last_refresh": data.get("last_refresh"),
@@ -1743,6 +2158,41 @@ def viewer():
     if viewer_path.exists():
         return HTMLResponse(viewer_path.read_text(encoding='utf-8'))
     return HTMLResponse("<h1>Viewer not found</h1>")
+
+
+# ── Pending-reads preload status ──
+# The popup window closes when the viewer tab opens, so user-visible feedback
+# has to live somewhere both the background script can write to and the viewer
+# can read. Singleton, in-memory — restart-safe doesn't matter for live status.
+
+_pending_status = {"running": False, "lines": [], "started_at": None, "updated_at": None}
+
+
+@app.post("/api/pending-reads/status")
+async def update_pending_status(payload: dict):
+    """Background script posts progress updates here for the viewer to display."""
+    if payload.get("reset"):
+        _pending_status["lines"] = []
+        _pending_status["started_at"] = datetime.now().isoformat()
+    if "running" in payload:
+        _pending_status["running"] = bool(payload["running"])
+    line = payload.get("line")
+    if line:
+        _pending_status["lines"].append({
+            "text": str(line),
+            "cls": payload.get("cls", "info"),
+            "at": datetime.now().isoformat(),
+        })
+        # Cap to last 200 lines to avoid runaway memory
+        if len(_pending_status["lines"]) > 200:
+            _pending_status["lines"] = _pending_status["lines"][-200:]
+    _pending_status["updated_at"] = datetime.now().isoformat()
+    return {"status": "ok"}
+
+
+@app.get("/api/pending-reads/status")
+def get_pending_status():
+    return _pending_status
 
 
 # ── Helpers ──

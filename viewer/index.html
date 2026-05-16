@@ -532,9 +532,13 @@
   <div class="sidebar" id="sidebar">
     <div class="sidebar-header">
       <h1>Clinic</h1>
-      <button type="button" onclick="toggleSidebar()" aria-label="Close sidebar">
-        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
+      <div style="display:flex; align-items:center; gap:4px;">
+        <a id="modeSwitchLink" href="?mode=pending" title="Switch to pending reads"
+           style="font-size:11px; color:#38bdf8; text-decoration:none; padding:4px 8px; border:1px solid #1e3a5f; border-radius:4px; background:#0c2d4a;">Pending →</a>
+        <button type="button" onclick="toggleSidebar()" aria-label="Close sidebar">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
     </div>
     <div id="providerFilterBar" style="display:none; padding:6px 10px; border-bottom:1px solid #1e293b; flex-wrap:wrap; gap:4px;"></div>
     <div class="patient-list" id="patientList">
@@ -673,6 +677,70 @@
   const _castPatient = _urlParams.get('patient');
   const _displayMode = _urlParams.has('displaymode');
   const _isHipKnee   = _urlParams.get('specialty') === 'hipknee';
+  // Pending-reads mode: only show patients loaded from a pending-reads OCR,
+  // hide provider/region/modality filters since the list is curated.
+  const _pendingMode = _urlParams.get('mode') === 'pending';
+  // Mode-switch button: in clinic → "Pending →", in pending → "← Clinic"
+  setTimeout(() => {
+    const link = document.getElementById('modeSwitchLink');
+    if (link) {
+      if (_pendingMode) {
+        link.textContent = '← Clinic';
+        link.href = window.location.pathname;
+        link.title = 'Switch to clinic view';
+      } else {
+        link.textContent = 'Pending →';
+        link.href = window.location.pathname + '?mode=pending';
+        link.title = 'Switch to pending reads';
+      }
+    }
+  }, 0);
+
+  if (_pendingMode) {
+    document.querySelector('.sidebar-header h1').textContent = 'Pending Reads';
+    document.title = 'Pending Reads';
+    // Hide image-tooling controls that don't apply to a reading queue.
+    // `!important` defeats any later JS that tries to show these (e.g. the
+    // filter bar reappearing when a study with multiple regions is selected).
+    const hideStyle = document.createElement('style');
+    hideStyle.textContent = `
+      #castBar, #filterBar, #bcBar { display: none !important; }
+    `;
+    document.head.appendChild(hideStyle);
+    // Inject a live preload-status panel since the popup closes when this tab opens.
+    setTimeout(() => {
+      const panel = document.createElement('div');
+      panel.id = 'pendingStatusPanel';
+      panel.style.cssText = 'position:fixed; bottom:10px; left:10px; right:10px; max-height:180px; '
+        + 'overflow:auto; background:rgba(15,23,42,0.96); border:1px solid #334155; '
+        + 'border-radius:8px; padding:8px 12px; font-family:Consolas,monospace; font-size:11px; '
+        + 'color:#cbd5e1; z-index:9999; display:none;';
+      document.body.appendChild(panel);
+      pollPendingStatus();
+      setInterval(pollPendingStatus, 2000);
+    }, 0);
+    async function pollPendingStatus() {
+      try {
+        const r = await fetch('/api/pending-reads/status');
+        const d = await r.json();
+        const panel = document.getElementById('pendingStatusPanel');
+        if (!panel) return;
+        const lines = d.lines || [];
+        if (!lines.length && !d.running) { panel.style.display = 'none'; return; }
+        panel.style.display = 'block';
+        const head = `<div style="color:#38bdf8; font-weight:600; margin-bottom:4px;">`
+          + `Preload ${d.running ? '⏳ running' : '✓ done'} — `
+          + `<a href="#" onclick="document.getElementById('pendingStatusPanel').style.display='none';return false;" `
+          + `style="color:#64748b; float:right;">hide</a></div>`;
+        const colorFor = c => c === 'error' ? '#f87171' : c === 'success' ? '#34d399' : '#cbd5e1';
+        panel.innerHTML = head + lines.slice(-30).map(l =>
+          `<div style="color:${colorFor(l.cls)}; white-space:pre-wrap;">${
+            String(l.text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          }</div>`).join('');
+        panel.scrollTop = panel.scrollHeight;
+      } catch (e) {}
+    }
+  }
   if (_isHipKnee) {
     document.getElementById('snapshotBtn').style.display = 'none';
   }
@@ -870,11 +938,30 @@
         }
       }
 
-      allLoadedPatients = data.patients;
-      updateProviderFilterBar(data.patients);
-      const visible = selectedViewerProviders.size
-        ? data.patients.filter(p => !p.provider || selectedViewerProviders.has(p.provider))
-        : data.patients;
+      // Pending mode: only show patients loaded from a pending-reads preload.
+      let scope = data.patients;
+      if (_pendingMode) {
+        scope = data.patients.filter(p => (p.source || '').startsWith('pending_'));
+        // Pending list groups by provider (server's default is date desc, which
+        // is right for the clinic view but wrong for a reading-queue workflow).
+        scope.sort((a, b) => {
+          const pa = (a.provider || '').toLowerCase();
+          const pb = (b.provider || '').toLowerCase();
+          if (pa !== pb) return pa < pb ? -1 : 1;
+          return (a.name || '').localeCompare(b.name || '');
+        });
+      } else {
+        scope = data.patients.filter(p => !(p.source || '').startsWith('pending_'));
+      }
+      allLoadedPatients = scope;
+      if (_pendingMode) {
+        document.getElementById('providerFilterBar').style.display = 'none';
+      } else {
+        updateProviderFilterBar(scope);
+      }
+      const visible = (!_pendingMode && selectedViewerProviders.size)
+        ? scope.filter(p => !p.provider || selectedViewerProviders.has(p.provider))
+        : scope;
       renderPatientList(visible);
     } catch (e) { console.error('loadPatients:', e); }
   }
@@ -915,21 +1002,28 @@
       return;
     }
 
-    // Group by clinic date, most recent first
+    // Group by provider (pending mode) or clinic date (clinic mode).
+    // Pending list is a reading queue — provider is the natural grouping; date
+    // is too granular and arbitrary since each row may have its own date.
+    const groupByProvider = _pendingMode;
     const groups = {};
     for (const p of patients) {
-      const dk = p.clinic_date || '';
-      if (!groups[dk]) groups[dk] = [];
-      groups[dk].push(p);
+      const gk = groupByProvider ? (p.provider || '(no provider)') : (p.clinic_date || '');
+      if (!groups[gk]) groups[gk] = [];
+      groups[gk].push(p);
     }
-    const sortedKeys = Object.keys(groups).sort((a, b) => b.localeCompare(a));
+    const sortedKeys = groupByProvider
+      ? Object.keys(groups).sort((a, b) => a.localeCompare(b))      // providers A→Z
+      : Object.keys(groups).sort((a, b) => b.localeCompare(a));     // dates newest first
 
-    // Auto-collapse all date groups except the newest on first load (only if they haven't been manually toggled)
-    // sortedKeys is descending, so the first key with an actual date is the newest
-    const newestDateKey = sortedKeys.find(dk => dk !== '') || sortedKeys[0] || '';
-    for (const dk of sortedKeys) {
-      if (dk !== newestDateKey && !collapsedDates.has(dk) && !collapsedDates.has('__expanded_' + dk)) {
-        collapsedDates.add(dk);
+    // Auto-collapse: in pending mode, expand all groups (provider list is short).
+    // In clinic mode, keep newest date open and collapse the rest.
+    const newestDateKey = groupByProvider ? '' : (sortedKeys.find(dk => dk !== '') || sortedKeys[0] || '');
+    if (!groupByProvider) {
+      for (const dk of sortedKeys) {
+        if (dk !== newestDateKey && !collapsedDates.has(dk) && !collapsedDates.has('__expanded_' + dk)) {
+          collapsedDates.add(dk);
+        }
       }
     }
 
@@ -946,10 +1040,17 @@
     for (const dk of sortedKeys) {
       const pts = groups[dk];
       const isCollapsed = collapsedDates.has(dk);
-      const label = dk ? formatClinicDate(dk) : 'Unscheduled';
+      const label = groupByProvider
+        ? (dk || '(no provider)')
+        : (dk ? formatClinicDate(dk) : 'Unscheduled');
       const countStr = `${pts.length} patient${pts.length !== 1 ? 's' : ''}`;
+      // Hide the per-date imaging-report button in provider-grouped (pending) mode
+      // since the report is keyed by date, not provider.
+      const reportBtnHtml = groupByProvider
+        ? ''
+        : `<button class="date-report-btn" title="Imaging report" onclick="event.stopPropagation(); openDateReport('${escAttr(dk)}')">${reportSvg}</button>`;
       html += `<div class="date-group${isCollapsed ? ' collapsed' : ''}" data-date="${escAttr(dk)}">
-        <div class="date-header" onclick="toggleDateGroup('${escAttr(dk)}')">${arrowSvg}<span>${escHtml(label)}</span><span class="date-patient-count">${countStr}</span><button class="date-report-btn" title="Imaging report" onclick="event.stopPropagation(); openDateReport('${escAttr(dk)}')">${reportSvg}</button></div>`;
+        <div class="date-header" onclick="toggleDateGroup('${escAttr(dk)}')">${arrowSvg}<span>${escHtml(label)}</span><span class="date-patient-count">${countStr}</span>${reportBtnHtml}</div>`;
       for (const p of pts) {
         const isPending = pendingRefreshKeys.has(p.key);
         const pendingAge = isPending ? formatRefreshAge(pendingRefreshKeys.get(p.key)) : '';
@@ -960,13 +1061,15 @@
         const lastRefreshHtml = lastRefresh
           ? ` · <span class="refresh-status status-${lastRefresh.status === 'downloading' ? 'done' : (lastRefresh.status || 'done')}">${formatLastRefresh(lastRefresh)}</span>`
           : '';
-        const visitTimeStr = p.clinic_time ? `<span class="patient-visit-time">· ${escHtml(p.clinic_time)}</span>` : '';
+        // Pending list is a reading queue — appointment times aren't relevant.
+        const visitTimeStr = (!_pendingMode && p.clinic_time)
+          ? `<span class="patient-visit-time">· ${escHtml(p.clinic_time)}</span>` : '';
         html += `<div class="patient-item${isPending ? ' refresh-pending' : ''}" data-key="${escAttr(p.key)}" onclick="selectPatient('${escAttr(p.key)}')">
           <div class="patient-item-inner">
             <div class="patient-item-content">
               <div class="patient-name">${escHtml(p.name)}${visitTimeStr}</div>
-              <div class="patient-meta">DOB: ${escHtml(p.dob)}${isPending ? ` · <span class="refresh-status ${statusClass}">${statusLabel || '↻ ' + escHtml(pendingAge)}</span>` : escHtml('')}${lastRefreshHtml}</div>
-              ${p.provider ? `<div class="patient-provider">${escHtml(p.provider)}</div>` : ''}
+              <div class="patient-meta">${p.dob ? 'DOB: ' + escHtml(p.dob) : (p.mrn ? 'MRN ' + escHtml(p.mrn) : '')}${p.procedure ? ' · ' + escHtml(p.procedure) : ''}${isPending ? ` · <span class="refresh-status ${statusClass}">${statusLabel || '↻ ' + escHtml(pendingAge)}</span>` : escHtml('')}${lastRefreshHtml}</div>
+              ${(!groupByProvider && p.provider) ? `<div class="patient-provider">${escHtml(p.provider)}</div>` : ''}
               <span class="patient-badge">${p.image_count} image${p.image_count !== 1 ? 's' : ''} · ${p.study_count} study</span>
             </div>
             <button class="patient-edit-btn" title="Edit patient name" onclick="event.stopPropagation(); startEditPatientName('${escAttr(p.key)}', '${escAttr(p.name)}')">${editSvg}</button>
@@ -1258,8 +1361,15 @@
       currentIndex = 0;
       applyRegionFilter();
       if (!_displayMode) {
-        if (_isHipKnee) toggleCompareMode();
-        else toggleSnapshotMode();
+        if (_pendingMode) {
+          // Pending mode: open the first study in row view (same as clicking the
+          // first study button) — shows the whole study, not a single image.
+          if (allStudies.length) openStudyRow(allStudies[0].key);
+        } else if (_isHipKnee) {
+          toggleCompareMode();
+        } else {
+          toggleSnapshotMode();
+        }
       }
 
       if (window.innerWidth <= 700) document.getElementById('sidebar').classList.remove('open');

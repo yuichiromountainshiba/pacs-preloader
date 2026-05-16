@@ -209,6 +209,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+  if (msg.action === 'startPendingPreload') {
+    runPendingPreload(msg).catch(console.error);
+    sendResponse({ ok: true });
+    return true;
+  }
   if (msg.action === 'getStatus') {
     sendResponse({ isPreloading, patientCount: scheduledPatients.length });
     return true;
@@ -292,6 +297,244 @@ async function runPreload({ patients, serverUrl, clinicDate, filters, tabId, tab
   postToPopup({ action: 'preloadLog', text: `\n✓ Preload complete! ${totalImages} total image(s) saved in ${timeStr} (${patients.length} patients, ${n} tabs).`, cls: 'success' });
   postToPopup({ action: 'preloadDone' });
   isPreloading = false;
+}
+
+
+// ── Pending-reads preload loop ──
+//
+// Forked from runPreload because each pending row carries its own match-date
+// (the appt or study date from the OCR'd source) and may have an empty DOB
+// (email reminders carry MRN instead). The shape divergence is small enough
+// that a focused fork is clearer than parameterising runPreload.
+// Helper: post a status line to BOTH the popup (if open) AND the server-side
+// status endpoint (which the viewer polls). Popup may be closed by the time
+// the viewer opens, so server-side log is the only reliable user-facing trail.
+function pendingStatus(serverUrl, line, cls = 'info', extra = {}) {
+  postToPopup({ action: 'preloadLog', text: line, cls });
+  fetch(`${serverUrl}/api/pending-reads/status`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ line, cls, ...extra }),
+  }).catch(() => {});
+}
+
+async function runPendingPreload({ rows, source, serverUrl, tabId }) {
+  if (isPreloading) {
+    pendingStatus(serverUrl,
+      '⚠ Another preload is already running — skipping. Reload the extension if stuck.', 'error');
+    return;
+  }
+  if (!rows || !rows.length) return;
+  isPreloading = true;
+  pacsTabId = tabId;
+
+  // Reset the server-side status log so this run gets a clean slate
+  fetch(`${serverUrl}/api/pending-reads/status`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reset: true, running: true,
+      line: `Starting pending preload: ${rows.length} row(s) from ${source}`, cls: 'info' }),
+  }).catch(() => {});
+
+  const runStart = Date.now();
+  postToPopup({ action: 'preloadLog',
+    text: `Starting pending preload: ${rows.length} row(s) from ${source}`, cls: 'info' });
+
+  let tabIds = [], openedByUs = [];
+  let completed = 0;
+  let totalImages = 0;
+
+  try {
+    ({ tabIds, openedByUs } = await openPacsTabs(1, tabId));
+    pacsTabId = tabIds[0];
+    for (const tid of tabIds) await claimPacsTab(tid);
+    const targetTab = tabIds[0];
+
+  for (const row of rows) {
+    const patientName = row.name;
+    const dob = row.dob || '';
+    const mrn = row.mrn || '';
+    const procedure = row.procedure || row.study_description || '';
+    const matchDate = row.appt_date || row.study_date || '';
+    const matchTime = row.appt_time || row.study_time || '';
+    const provider = row.provider || '';
+    // Mirror server's sanitize_filename so the JS-supplied key matches what the
+    // server would have computed (commas/periods stripped, runs of whitespace → _).
+    const patientKey = 'pr_' + (patientName + '_' + (dob || mrn))
+      .replace(/[^\w\s\-.]/g, '')
+      .replace(/\s+/g, '_')
+      .slice(0, 100);
+
+    postToPopup({ action: 'preloadProgress', current: completed, total: rows.length, label: `Searching: ${patientName}` });
+    pendingStatus(serverUrl,
+      `[${completed + 1}/${rows.length}] ${patientName}${dob ? ' (DOB ' + dob + ')' : mrn ? ' (MRN ' + mrn + ')' : ''} — ${procedure}`,
+      'info');
+
+    try { await withTimeout((async () => {
+      try { await chrome.tabs.update(targetTab, { active: true }); } catch {}
+
+      // Register the patient up-front so the viewer shows the row immediately,
+      // even if PACS search returns nothing.
+      await registerPendingPatient({
+        name: patientName, dob, mrn, procedure, provider,
+        clinicDate: matchDate, clinicTime: matchTime,
+        source, patientKey, serverUrl,
+      });
+
+      // Search — filters null so region/modality never narrow the result.
+      const attempts = [patientName];
+      let result = await sendToContentScriptTab(targetTab, 'searchPatient', {
+        name: patientName, dob, filters: null, todayOnly: false,
+      });
+
+      if (result.error && /patientName.*not found|Patient Search page/i.test(result.error)) {
+        const ready = await waitForSearchInputReady(targetTab, 30000);
+        if (ready) {
+          result = await sendToContentScriptTab(targetTab, 'searchPatient', {
+            name: patientName, dob, filters: null, todayOnly: false,
+          });
+        }
+      }
+      if (result.error) {
+        pendingStatus(serverUrl, `  ✗ Search error: ${result.error}`, 'error');
+        completed++; continue;
+      }
+
+      if (!result.studies || result.studies.length === 0) {
+        const fallbackName = buildFallbackName(patientName);
+        if (fallbackName && fallbackName !== patientName) {
+          attempts.push(fallbackName);
+          pendingStatus(serverUrl, `  ↻ No primary match — trying alt: ${fallbackName}`, 'info');
+          result = await sendToContentScriptTab(targetTab, 'searchPatient', {
+            name: fallbackName, dob, filters: null, todayOnly: false,
+          });
+        }
+      }
+      if (!result.studies || result.studies.length === 0) {
+        pendingStatus(serverUrl, `  ✗ No studies — tried: ${attempts.join(' + ')}`, 'error');
+        completed++; continue;
+      }
+
+      // Filter studies to the row's date. Pending rows are one (patient, date,
+      // procedure) tuple — without this filter we'd preload every study the
+      // patient has ever had, defeating the point of a pending list.
+      // Studies with an empty studyDate (PACS date-parse miss) are accepted —
+      // better to over-fetch than to silently drop everything if PACS changes format.
+      const wantDate = normalisePendingDate(matchDate);
+      const matchingStudies = wantDate
+        ? result.studies.filter(s => {
+            const got = normalisePendingDate(s.studyDate);
+            return !got || got === wantDate;
+          })
+        : result.studies;
+      if (!matchingStudies.length) {
+        const foundDates = [...new Set(result.studies.map(s =>
+          `${s.studyDate || '(empty)'} → ${normalisePendingDate(s.studyDate) || '(empty)'}`))].join(', ');
+        const foundNames = [...new Set(result.studies.map(s => s.patientName).filter(Boolean))].join(', ');
+        pendingStatus(serverUrl,
+          `  ✗ No study matching ${matchDate} (wanted ${wantDate}). Found ${result.studies.length} study(ies) for ${foundNames || '?'}: ${foundDates || 'no dates'}`,
+          'error');
+        completed++; continue;
+      }
+
+      const eligibleStudies = matchingStudies.filter(s => s.series && s.series.length > 0);
+      pendingStatus(serverUrl,
+        `  ${matchingStudies.length} study(ies) on ${matchDate} — ${eligibleStudies.length} with series`,
+        'success');
+
+      const sentResults = await Promise.all(
+        eligibleStudies.map(study =>
+          sendToContentScriptTab(targetTab, 'batchPreloadStudy', {
+            studyUid:         study.studyUid,
+            series:           study.series,
+            patient:          { name: patientName, dob, provider },
+            studyDescription: study.description || '',
+            studyDate:        study.studyDate || '',
+            modality:         study.modality || '',
+            location:         study.location || '',
+            serverUrl,
+            clinicDate:       matchDate,
+            patientKey,
+            source, mrn, procedure,
+          }).catch(e => ({ error: e.message, count: 0 }))
+        )
+      );
+
+      for (const [i, sent] of sentResults.entries()) {
+        const study = eligibleStudies[i];
+        if (sent.error) {
+          pendingStatus(serverUrl, `    ✗ ${study.description}: ${sent.error}`, 'error');
+          continue;
+        }
+        pendingStatus(serverUrl, `    ✓ ${sent.count} image(s) — ${study.description}`, 'success');
+        totalImages += sent.count || 0;
+      }
+    })(), 300000, `Row timed out after 5 min: ${patientName}`); }
+    catch (err) {
+      pendingStatus(serverUrl, `  ✗ Error: ${err.message}`, 'error');
+    }
+    completed++;
+    await sleep(300);
+  }
+
+    for (const tid of openedByUs) chrome.tabs.remove(tid).catch(() => {});
+
+    const elapsed = Date.now() - runStart;
+    const mins = Math.floor(elapsed / 60000), secs = Math.floor((elapsed % 60000) / 1000);
+    const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    postToPopup({ action: 'preloadProgress', current: rows.length, total: rows.length, label: 'Done!' });
+    pendingStatus(serverUrl,
+      `✓ Pending preload complete — ${totalImages} image(s) in ${timeStr}.`, 'success',
+      { running: false });
+    postToPopup({ action: 'preloadDone' });
+  } catch (err) {
+    pendingStatus(serverUrl, `✗ Pending preload crashed: ${err.message}`, 'error', { running: false });
+    console.error('[runPendingPreload] fatal:', err);
+  } finally {
+    // Always reset so the next click isn't silently blocked.
+    isPreloading = false;
+    postToPopup({ action: 'preloadDone' });
+    fetch(`${serverUrl}/api/pending-reads/status`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ running: false }),
+    }).catch(() => {});
+  }
+}
+
+
+// Normalise to YYYYMMDD — that's what content.js produces for studyDate
+// (line ~359: PACS returns 'YYYY-MM-DD ...' and content.js strips to 'YYYYMMDD').
+// The OCR'd row dates come in as 'M/D/YYYY'. Both must collapse to the same
+// canonical form or the per-row date filter rejects every study.
+function normalisePendingDate(s) {
+  if (!s) return '';
+  s = String(s).trim();
+  if (/^\d{8}$/.test(s)) return s;
+  const m1 = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (m1) {
+    let y = m1[3]; if (y.length === 2) y = (parseInt(y) > 30 ? '19' : '20') + y;
+    return y + m1[1].padStart(2, '0') + m1[2].padStart(2, '0');
+  }
+  const m2 = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m2) return m2[1] + m2[2].padStart(2, '0') + m2[3].padStart(2, '0');
+  return s;
+}
+
+
+async function registerPendingPatient({ name, dob, mrn, procedure, provider, clinicDate, clinicTime, source, patientKey, serverUrl }) {
+  try {
+    const form = new FormData();
+    form.append('patient_name', name);
+    form.append('patient_dob', dob);
+    form.append('clinic_date', clinicDate || '');
+    form.append('clinic_time', clinicTime || '');
+    form.append('provider', provider || '');
+    form.append('source', source);
+    form.append('mrn', mrn || '');
+    form.append('procedure', procedure || '');
+    if (patientKey) form.append('patient_key', patientKey);
+    await fetch(`${serverUrl}/api/patients/register`, { method: 'POST', body: form });
+  } catch (e) { /* non-critical — /api/images will create the patient if this fails */ }
 }
 
 
