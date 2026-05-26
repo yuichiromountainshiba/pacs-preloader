@@ -397,7 +397,7 @@ async function runPendingPreload({ rows, source, serverUrl, tabId }) {
       }
       if (result.error) {
         pendingStatus(serverUrl, `  ✗ Search error: ${result.error}`, 'error');
-        completed++; continue;
+        return;
       }
 
       if (!result.studies || result.studies.length === 0) {
@@ -412,7 +412,7 @@ async function runPendingPreload({ rows, source, serverUrl, tabId }) {
       }
       if (!result.studies || result.studies.length === 0) {
         pendingStatus(serverUrl, `  ✗ No studies — tried: ${attempts.join(' + ')}`, 'error');
-        completed++; continue;
+        return;
       }
 
       // Filter studies to the row's date. Pending rows are one (patient, date,
@@ -434,7 +434,7 @@ async function runPendingPreload({ rows, source, serverUrl, tabId }) {
         pendingStatus(serverUrl,
           `  ✗ No study matching ${matchDate} (wanted ${wantDate}). Found ${result.studies.length} study(ies) for ${foundNames || '?'}: ${foundDates || 'no dates'}`,
           'error');
-        completed++; continue;
+        return;
       }
 
       const eligibleStudies = matchingStudies.filter(s => s.series && s.series.length > 0);
