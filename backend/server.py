@@ -154,6 +154,44 @@ async def ocr_image(image: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/schedule/import")
+async def import_schedule(req: dict = {}):
+    """Accept a parsed schedule from epic_capture and register all patients."""
+    patients = req.get("patients", [])
+    registered = []
+    index = _get_cached_index()
+    for p in patients:
+        name = p.get("name", "").strip()
+        dob = p.get("dob", "").strip()
+        if not name or not dob:
+            continue
+        key = sanitize_filename(f"{name}_{dob}")
+        clinic_time = p.get("time", "")
+        provider = p.get("provider", "")
+        if key not in index["patients"]:
+            index["patients"][key] = {
+                "name": name, "dob": dob, "clinic_date": "",
+                "clinic_time": clinic_time, "provider": provider,
+                "studies": {}, "image_count": 0,
+                "created_at": datetime.now().isoformat(),
+            }
+        else:
+            pt = index["patients"][key]
+            if clinic_time:
+                pt["clinic_time"] = clinic_time
+            if provider and not pt.get("provider"):
+                pt["provider"] = provider
+        registered.append(key)
+    if registered:
+        save_index(index)
+    # Also store as pending refreshes so extension picks them up
+    for key in registered:
+        index.setdefault("pending_refreshes", {})[key] = datetime.now().isoformat()
+    if registered:
+        save_index(index)
+    return {"status": "ok", "registered": len(registered), "keys": registered}
+
+
 @app.post("/api/patients/register")
 async def register_patient(
     patient_name: str = Form(...),
