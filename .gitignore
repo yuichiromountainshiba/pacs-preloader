@@ -10,3 +10,18 @@ pacs_data/
 # OS
 .DS_Store
 Thumbs.db
+
+# --- hardening (2026-08-22 credential-exposure pass, yw) ---
+# Root cause: `*.local` never covered `*.local.mjs`. Catch the CLASS, not the filename.
+*.local
+*.local.*
+*.local/
+*.scratch.*
+*.private.*
+*.secrets.*
+provision-*.mjs
+grant-*.mjs
+*-pw.*
+*.pw
+*.pgpass
+.pgpass
